@@ -1,0 +1,38 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+env/
+
+# Note: robocommand/RobotX_2026/gen/python/**/__pycache__/*.pyc are tracked
+# upstream. Those regenerate whenever the UI imports the vendored protos, so
+# running the app dirties the submodule. Restore them after a run:
+#   git -C robocommand checkout -- \
+#     'RobotX_2026/gen/python/__pycache__' \
+#     'RobotX_2026/gen/python/robotx/__pycache__'
+
+# RoboCommand test-server session logs (docker compose bind-mounts ./logs)
+robocommand/RobotX_2026/logs/
+
+# Qt / editor
+*.qmlc
+*.jsc
+*.pro.user
+*.autosave
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Test scratch
+/tmp/
+*.log
+!robocommand/**/logs/README*
