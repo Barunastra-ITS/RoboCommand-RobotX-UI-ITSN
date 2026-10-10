@@ -36,3 +36,6 @@ Thumbs.db
 /tmp/
 *.log
 !robocommand/**/logs/README*
+# colcon workspace output
+/install/
+/log/

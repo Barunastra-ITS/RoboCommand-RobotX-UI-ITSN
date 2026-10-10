@@ -1,21 +1,23 @@
-"""Connection Bar widget for RoboCommand network selection and status."""
+"""Connection bar: which RoboCommand broker the host monitor listens to.
+
+On the course host itself (e.g. 192.168.65.2) use "This host"; the course
+presets let the same monitor watch a course broker from another machine.
+"""
 
 from PyQt5.QtWidgets import (
     QWidget, QHBoxLayout, QLabel, QLineEdit, QPushButton, QComboBox, QFrame, QStyle
 )
 from PyQt5.QtCore import pyqtSignal, Qt
 
-COURSE_PRESETS = {
-    "Course Alpha": ("192.168.65.2", 1883),
-    "Course Bravo": ("192.168.66.2", 1883),
-    "Course Charlie": ("192.168.67.2", 1883),
-    "Course Delta": ("192.168.68.2", 1883),
-    "Team Village Demo": ("localhost", 1883),
-}
+from robocommand_ui.courses import MQTT_PORT, course_hosts
+
+LOCAL_PRESET = "This host (localhost)"
+COURSE_PRESETS = {LOCAL_PRESET: ("localhost", MQTT_PORT)}
+COURSE_PRESETS.update({f"{c.name} ({c.host})": (c.host, MQTT_PORT) for c in course_hosts()})
 
 
 class ConnectionBar(QFrame):
-    connect_requested = pyqtSignal(str, int, str)
+    connect_requested = pyqtSignal(str, int)
     disconnect_requested = pyqtSignal()
 
     def __init__(self, parent=None):
@@ -68,7 +70,7 @@ class ConnectionBar(QFrame):
         layout.addWidget(QLabel("Preset:"))
         self.preset_combo = QComboBox()
         self.preset_combo.addItems(list(COURSE_PRESETS.keys()))
-        self.preset_combo.setCurrentText("Team Village Demo")
+        self.preset_combo.setCurrentText(LOCAL_PRESET)
         self.preset_combo.currentIndexChanged.connect(self._on_preset_changed)
         layout.addWidget(self.preset_combo)
 
@@ -83,12 +85,6 @@ class ConnectionBar(QFrame):
         self.port_input = QLineEdit("1883")
         self.port_input.setFixedWidth(60)
         layout.addWidget(self.port_input)
-
-        # Team ID
-        layout.addWidget(QLabel("Team ID:"))
-        self.team_input = QLineEdit("ITSN")
-        self.team_input.setFixedWidth(80)
-        layout.addWidget(self.team_input)
 
         # Connect / Disconnect button
         self.toggle_btn = QPushButton("Connect")
@@ -121,16 +117,10 @@ class ConnectionBar(QFrame):
                 self.status_label.setStyleSheet(
                     "color: #f38ba8; font-weight: bold; padding-left: 10px;")
                 return
-            team = self.team_input.text().strip() or "ITSN"
-            if not team.replace("_", "").replace("-", "").isalnum():
-                self.status_label.setText("● Invalid team_id")
-                self.status_label.setStyleSheet(
-                    "color: #f38ba8; font-weight: bold; padding-left: 10px;")
-                return
             self.status_label.setText("● Connecting...")
             self.status_label.setStyleSheet(
                 "color: #f9e2af; font-weight: bold; padding-left: 10px;")
-            self.connect_requested.emit(host, port, team)
+            self.connect_requested.emit(host, port)
         else:
             self.disconnect_requested.emit()
 
@@ -144,7 +134,6 @@ class ConnectionBar(QFrame):
             self.status_label.setStyleSheet("color: #a6e3a1; font-weight: bold; padding-left: 10px;")
             self.host_input.setEnabled(False)
             self.port_input.setEnabled(False)
-            self.team_input.setEnabled(False)
             self.preset_combo.setEnabled(False)
         else:
             self.toggle_btn.setText("Connect")
@@ -154,7 +143,6 @@ class ConnectionBar(QFrame):
             self.status_label.setStyleSheet("color: #f38ba8; font-weight: bold; padding-left: 10px;")
             self.host_input.setEnabled(True)
             self.port_input.setEnabled(True)
-            self.team_input.setEnabled(True)
             self.preset_combo.setEnabled(True)
 
     def set_error(self, err_msg: str):

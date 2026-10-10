@@ -1,38 +1,21 @@
 #!/usr/bin/env bash
-# Run the RoboCommand UI test suite against a throwaway local broker.
+# Run the RoboCommand host monitor + report.py test suite.
+# PYTHON overrides the interpreter (it needs protobuf >= the vendored gencode).
 set -uo pipefail
 
 cd "$(dirname "$0")/.."
+PY="${PYTHON:-python3}"
+export QT_QPA_PLATFORM="${QT_QPA_PLATFORM:-offscreen}"
 
 rc=0
-
-# Standalone unit tests first (no broker needed)
-if ! python3 tests/test_course_validation.py; then
-    rc=1
-fi
-
-# Integration suites start their own throwaway broker on 18830
-for t in tests/test_ui_integration.py tests/test_robustness.py; do
+for t in tests/test_course_validation.py tests/test_fleet_state.py \
+         tests/test_report.py tests/test_host_loopback.py tests/test_live_broker.py; do
     echo ""
     echo "########## $t ##########"
-    if ! python3 "$t"; then
+    if ! "$PY" "$t"; then
         rc=1
     fi
 done
-
-# Compose-stack suite needs the documented broker on 1883.
-if ss -ltn 2>/dev/null | grep -q ':1883 '; then
-    echo ""
-    echo "########## tests/test_compose_stack.py ##########"
-    if ! python3 tests/test_compose_stack.py; then
-        rc=1
-    fi
-else
-    echo ""
-    echo "Skipping tests/test_compose_stack.py (no broker on :1883)."
-    echo "Start it with:"
-    echo "  docker compose -f robocommand/RobotX_2026/docker-compose.yml up -d broker"
-fi
 
 echo ""
 if [ "$rc" -eq 0 ]; then

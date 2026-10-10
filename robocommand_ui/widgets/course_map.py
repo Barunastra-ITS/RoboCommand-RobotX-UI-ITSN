@@ -2,9 +2,10 @@
 
 Renders the standard RobotX 2026 course schematic (pontoons + UAV L/R, Safe
 Passage buoy field, pipeline, Coordinated Logistics platform, seawall) scaled
-to fit the received RxCourse boundary, then overlays the live data the OCS
-actually has: vehicle positions/headings, the UAV geofence, and the task
-reports (Safe Passage buoys with beacon states, the pipeline survey).
+to fit the received RxCourse boundary, then overlays what teams report to
+this host: each vehicle's position, heading and movement trail (labelled
+TEAM/VEHICLE), the declared UAV geofence, and the latest task reports (Safe
+Passage buoys with beacon states, the pipeline survey).
 
 Only the boundary polygon comes from the wire. The schematic elements are the
 standardized course layout and are drawn as a labeled context layer; the live
@@ -92,7 +93,7 @@ class CourseMapWidget(QGroupBox):
 
         # toolbar
         tb = QHBoxLayout()
-        tb.addWidget(QLabel("Course map: live positions over the standard course schematic."))
+        tb.addWidget(QLabel("Reported positions and trails, labelled TEAM/VEHICLE."))
         tb.addStretch()
         self.schematic_chk = QCheckBox("schematic")
         self.schematic_chk.setChecked(True)
@@ -117,27 +118,31 @@ class CourseMapWidget(QGroupBox):
         self._canvas.set_geofence(points)
         self.update()
 
-    def update_vehicle(self, vehicle_id, heartbeat, seq):
-        self._canvas.set_vehicle(vehicle_id, heartbeat)
-        self.update()
+    def show_fleet(self, fleet, team_filter=None):
+        """Draw every reporting vehicle (or one team's) from a FleetState."""
+        c = self._canvas
+        c.clear_vehicles()
+        c.clear_task_data()
+        for v in fleet.vehicles_of(team_filter):
+            if v.last_hb is not None and v.last_hb.HasField("position"):
+                c.set_vehicle(f"{v.team_id}/{v.vehicle_id}", v.last_hb, list(v.trail))
+        teams = [fleet.teams[t] for t in fleet.team_ids() if team_filter in (None, t)]
+        c.set_geofence([])
+        # Geofence and task overlays belong to one team; only one runs per course
+        if len(teams) == 1:
+            team = teams[0]
+            c.set_geofence(team.geofence)
+            if team.safe_passage:
+                c.set_safe_passage(*team.safe_passage)
+            if team.pipeline:
+                c.set_pipeline(*team.pipeline)
+        c.update()
 
-    def set_safe_passage(self, entry, exit_pos, buoys):
-        """entry/exit: (lat, lng); buoys: list[(lat, lng, beacon_state_int)]."""
-        self._canvas.set_safe_passage(entry, exit_pos, buoys)
-        self.update()
-
-    def set_pipeline(self, active, segments):
-        """active: (lat, lng); segments: list[PIPELINE_SEGMENT_* int]."""
-        self._canvas.set_pipeline(active, segments)
-        self.update()
-
-    def clear_vehicles(self):
+    def clear(self):
         self._canvas.clear_vehicles()
-        self.update()
-
-    def clear_task_data(self):
         self._canvas.clear_task_data()
-        self.update()
+        self._canvas.set_geofence([])
+        self._canvas.update()
 
 
 class MapCanvas(QWidget):
@@ -147,7 +152,7 @@ class MapCanvas(QWidget):
         self.setStyleSheet("background-color: #0f1824; border-radius: 4px;")
         self._course_points = []
         self._geofence_points = []
-        self._vehicles = {}
+        self._vehicles = {}        # label -> (heartbeat, trail [(lat, lng)])
         self._course_id = ""
         self._show_schematic = True
         self._sp_entry = None      # (lat, lng)
@@ -168,8 +173,8 @@ class MapCanvas(QWidget):
     def set_geofence(self, points):
         self._geofence_points = points
 
-    def set_vehicle(self, vehicle_id, heartbeat):
-        self._vehicles[vehicle_id] = heartbeat
+    def set_vehicle(self, label, heartbeat, trail=()):
+        self._vehicles[label] = (heartbeat, trail)
 
     def clear_vehicles(self):
         self._vehicles.clear()
@@ -193,7 +198,7 @@ class MapCanvas(QWidget):
     # --- geometry helpers ---
     def _all_points(self):
         pts = list(self._course_points) + list(self._geofence_points)
-        for hb in self._vehicles.values():
+        for hb, _ in self._vehicles.values():
             pts.append((hb.position.latitude, hb.position.longitude))
         if self._sp_entry:
             pts.append(self._sp_entry)
@@ -311,8 +316,18 @@ class MapCanvas(QWidget):
             p.setPen(QPen(GEOFENCE, 2, Qt.DashLine))
             p.drawPolygon(poly)
 
+        # --- vehicle trails (movement history) ---
+        for hb, trail in self._vehicles.values():
+            if len(trail) < 2:
+                continue
+            color = QColor(VEHICLE_COLORS.get(_type_key(hb), UNKNOWN_COLOR))
+            color.setAlpha(150)
+            p.setPen(QPen(color, 2))
+            p.setBrush(Qt.NoBrush)
+            p.drawPolyline(QPolygonF([scr(a, b) for a, b in trail]))
+
         # --- vehicles (top layer) ---
-        for vid, hb in self._vehicles.items():
+        for vid, (hb, _) in self._vehicles.items():
             key = _type_key(hb)
             color = VEHICLE_COLORS.get(key, UNKNOWN_COLOR)
             q = scr(hb.position.latitude, hb.position.longitude)
@@ -335,7 +350,7 @@ class MapCanvas(QWidget):
             p.drawText(8, 14, f"Course: {self._course_id}")
             p.setFont(QFont(QFont().family(), 6))
             p.setPen(QPen(QColor(0x44, 0x55, 0x66)))
-            p.drawText(8, 26, "live positions over standard course schematic")
+            p.drawText(8, 26, "reported positions and trails over standard course schematic")
 
     # --- drawing helpers ---
     def _draw_buoy(self, p, c, color, flashing, size):

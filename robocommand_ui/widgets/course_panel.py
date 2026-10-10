@@ -6,6 +6,8 @@ from PyQt5.QtWidgets import (
 )
 from PyQt5.QtCore import Qt
 
+from robocommand_ui.course_validation import validate_course
+
 
 class CoursePanel(QGroupBox):
     def __init__(self, parent=None):
@@ -103,38 +105,3 @@ class CoursePanel(QGroupBox):
             self.validation_label.setStyleSheet(
                 "color: #a6e3a1; font-size: 12px; padding: 2px;")
 
-
-def validate_course(course):
-    """Check RxCourse against the Team Handbook 3.4.9 before a run begins.
-
-    Returns a list of human-readable problems; empty means the course is
-    usable. RoboCommand validates the UAV geofence against the course
-    boundary, so an unusable boundary would stall the run at RunStart.
-    """
-    issues = []
-    if not course.course_id:
-        issues.append("course_id is empty")
-
-    if not course.pinger_freq_hz:
-        issues.append("pinger_freq_hz is zero")
-
-    corners = course.corners
-    if len(corners) < 3:
-        issues.append(f"boundary has only {len(corners)} corner(s) (need >= 3)")
-
-    for i, c in enumerate(corners):
-        if not (-90.0 <= c.latitude <= 90.0):
-            issues.append(f"corner {i + 1} latitude {c.latitude} out of range")
-        if not (-180.0 <= c.longitude <= 180.0):
-            issues.append(f"corner {i + 1} longitude {c.longitude} out of range")
-
-    if len(corners) >= 2:
-        first, last = corners[0], corners[-1]
-        if first.latitude != last.latitude or first.longitude != last.longitude:
-            issues.append(
-                "boundary is not a closed polygon "
-                f"(first corner {first.latitude:.7f},{first.longitude:.7f} "
-                f"!= last corner {last.latitude:.7f},{last.longitude:.7f})"
-            )
-
-    return issues
