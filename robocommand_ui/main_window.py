@@ -5,79 +5,60 @@ shows what every team's GCS/OCS reports to it: the boat movement on a course
 map, per-vehicle telemetry, and each team's run status. It only listens on
 ``robocommand/robotx/#`` and never publishes.
 
-Layout: connection bar, status strip with a team filter, then the course map
-(left) beside course config, team status and vehicle cards (right), with the
-message log pinned at the bottom.
+Layout: a header (brand, course/run/live chips, team filter, connection),
+the course map with the log drawer beneath it, and a right rail with teams,
+vehicles and the course summary.
 """
+
+import time
 
 from PyQt5.QtCore import Qt, QTimer
 from PyQt5.QtWidgets import (
-    QComboBox, QFrame, QHBoxLayout, QLabel, QMainWindow, QScrollArea, QSplitter,
-    QVBoxLayout, QWidget,
+    QApplication, QComboBox, QFrame, QHBoxLayout, QLabel, QMainWindow, QScrollArea,
+    QSplitter, QVBoxLayout, QWidget,
 )
 
+from robocommand_ui import theme
 from robocommand_ui.course_validation import validate_course
-from robocommand_ui.fleet_state import FleetState
+from robocommand_ui.fleet_state import STALE_SECONDS, FleetState
 from robocommand_ui.mqtt_worker import MqttWorker
 from robocommand_ui.widgets.connection_bar import ConnectionBar
 from robocommand_ui.widgets.course_map import CourseMapWidget
 from robocommand_ui.widgets.course_panel import CoursePanel
 from robocommand_ui.widgets.log_panel import LogPanel
-from robocommand_ui.widgets.teams_panel import TeamsPanel
+from robocommand_ui.widgets.panel import make_chip, set_chip
+from robocommand_ui.widgets.teams_panel import RUN_COLORS, TeamsPanel, format_age
 from robocommand_ui.widgets.vehicle_monitor import VehicleMonitorPanel
 
 ALL_TEAMS = "All teams"
 REFRESH_MS = 500            # matches the 2 Hz heartbeat rate
-
-STRIP_STYLE = """
-    QFrame#statusStrip {
-        background-color: #11111b;
-        border-bottom: 1px solid #313244;
-    }
-    QFrame#statusStrip QLabel {
-        color: #cdd6f4;
-        font-size: 12px;
-        padding: 0 6px;
-    }
-    QComboBox {
-        background-color: #313244;
-        color: #cdd6f4;
-        border: 1px solid #45475a;
-        border-radius: 4px;
-        padding: 2px 8px;
-    }
-"""
+RAIL_WIDTH = 440
 
 
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("RoboCommand RobotX 2026 — Host Monitor")
-        self.setMinimumSize(1280, 800)
-        self.resize(1520, 940)
-        self._apply_dark_theme()
+        self.setWindowTitle("RoboCommand Host Monitor — RobotX 2026")
+        self.setMinimumSize(1280, 780)
+        self.resize(1560, 960)
+        app = QApplication.instance()
+        if app is not None:
+            theme.apply(app)
 
         self.fleet = FleetState()
+        self._team_links = {}       # team_id -> last logged link state
         self.mqtt = MqttWorker(self)
 
-        central = QWidget()
-        self.setCentralWidget(central)
-        main_layout = QVBoxLayout(central)
-        main_layout.setContentsMargins(0, 0, 0, 0)
-        main_layout.setSpacing(0)
-
-        self.connection_bar = ConnectionBar()
-        main_layout.addWidget(self.connection_bar)
-        main_layout.addWidget(self._build_status_strip())
-        main_layout.addWidget(self._build_monitor_page(), 1)
-
-        self.log_panel = LogPanel()
-        self.log_panel.log_view.setFixedHeight(150)
-        main_layout.addWidget(self.log_panel)
+        root = QWidget()
+        root.setObjectName("Root")
+        self.setCentralWidget(root)
+        layout = QVBoxLayout(root)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+        layout.addWidget(self._build_header())
+        layout.addWidget(self._build_body(), 1)
 
         self.statusBar().showMessage("Ready. Choose the broker and press Connect.")
-        self.statusBar().setStyleSheet("background-color: #11111b; color: #6c7086;")
-
         self._connect_signals()
 
         self._refresh_timer = QTimer(self)
@@ -85,65 +66,95 @@ class MainWindow(QMainWindow):
         self._refresh_timer.start(REFRESH_MS)
 
     # ---------- builders ----------
-    def _build_status_strip(self):
-        strip = QFrame()
-        strip.setObjectName("statusStrip")
-        strip.setStyleSheet(STRIP_STYLE)
-        layout = QHBoxLayout(strip)
-        layout.setContentsMargins(10, 4, 10, 4)
-        self.course_id_label = QLabel("Course: ---")
-        self.course_id_label.setStyleSheet("color: #89b4fa;")
-        layout.addWidget(self.course_id_label)
-        layout.addWidget(QLabel("Show:"))
+    def _build_header(self):
+        header = QFrame()
+        header.setObjectName("Header")
+        row = QHBoxLayout(header)
+        row.setContentsMargins(16, 10, 16, 10)
+        row.setSpacing(10)
+
+        brand = QVBoxLayout()
+        brand.setSpacing(0)
+        title = QLabel("ROBOCOMMAND")
+        title.setObjectName("Brand")
+        sub = QLabel("Host monitor · listen-only")
+        sub.setObjectName("BrandSub")
+        brand.addWidget(title)
+        brand.addWidget(sub)
+        row.addLayout(brand)
+        row.addSpacing(14)
+
+        self.course_id_label = make_chip("COURSE —", theme.IDLE)
+        self.course_id_label.setToolTip("Retained RxCourse and its validity")
+        row.addWidget(self.course_id_label)
+        self.run_chip = make_chip("NO TEAMS", theme.IDLE)
+        self.run_chip.setToolTip("Run state of the team on this course")
+        row.addWidget(self.run_chip)
+        self.live_chip = make_chip("0 LIVE", theme.IDLE)
+        self.live_chip.setToolTip("Vehicles with a heartbeat in the last 2.5 s")
+        row.addWidget(self.live_chip)
+        row.addStretch()
+
         self.team_filter = QComboBox()
         self.team_filter.addItem(ALL_TEAMS)
         self.team_filter.setMinimumWidth(120)
+        self.team_filter.setCursor(Qt.PointingHandCursor)
+        self.team_filter.setToolTip("Show one team on the map and in the vehicle list")
         self.team_filter.currentIndexChanged.connect(self.refresh_views)
-        layout.addWidget(self.team_filter)
-        layout.addStretch()
-        layout.addWidget(QLabel("RoboCommand  RobotX 2026  Host Monitor (listen-only)"))
-        return strip
+        row.addWidget(self.team_filter)
 
-    def _build_monitor_page(self):
-        page = QWidget()
-        page_layout = QVBoxLayout(page)
-        page_layout.setContentsMargins(6, 6, 6, 6)
-        split = QSplitter(Qt.Horizontal)
+        divider = QFrame()
+        divider.setFixedSize(1, 24)
+        divider.setStyleSheet(f"background: {theme.BORDER};")
+        row.addWidget(divider)
 
+        self.connection_bar = ConnectionBar()
+        row.addWidget(self.connection_bar)
+        return header
+
+    def _build_body(self):
+        body = QSplitter(Qt.Horizontal)
+        body.setHandleWidth(10)
+
+        left = QSplitter(Qt.Vertical)
+        left.setHandleWidth(10)
         self.course_map = CourseMapWidget()
-        split.addWidget(self.course_map)
+        left.addWidget(self.course_map)
+        self.log_panel = LogPanel()
+        self.log_panel.setMinimumHeight(110)
+        left.addWidget(self.log_panel)
+        left.setStretchFactor(0, 4)
+        left.setStretchFactor(1, 1)
+        left.setSizes([700, 180])
+        body.addWidget(left)
 
-        right = QWidget()
-        right_layout = QVBoxLayout(right)
-        right_layout.setContentsMargins(0, 0, 6, 0)
-        right_layout.setSpacing(6)
-        self.course_panel = CoursePanel()
-        right_layout.addWidget(self.course_panel)
+        rail = QWidget()
+        rail_layout = QVBoxLayout(rail)
+        rail_layout.setContentsMargins(0, 0, 4, 0)
+        rail_layout.setSpacing(10)
         self.teams_panel = TeamsPanel()
-        right_layout.addWidget(self.teams_panel)
+        rail_layout.addWidget(self.teams_panel)
         self.vehicle_monitor = VehicleMonitorPanel()
-        right_layout.addWidget(self.vehicle_monitor, 1)
+        rail_layout.addWidget(self.vehicle_monitor)
+        self.course_panel = CoursePanel()
+        rail_layout.addWidget(self.course_panel)
+        rail_layout.addStretch()
 
-        right_scroll = QScrollArea()
-        right_scroll.setWidgetResizable(True)
-        right_scroll.setWidget(right)
-        right_scroll.setStyleSheet("QScrollArea { border: none; background-color: #1e1e2e; }")
-        split.addWidget(right_scroll)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        scroll.setWidget(rail)
+        scroll.setMinimumWidth(380)
+        body.addWidget(scroll)
+        body.setStretchFactor(0, 1)
+        body.setStretchFactor(1, 0)
+        body.setSizes([1560 - RAIL_WIDTH, RAIL_WIDTH])
 
-        split.setSizes([900, 560])
-        page_layout.addWidget(split)
-        return page
-
-    def _apply_dark_theme(self):
-        self.setStyleSheet("""
-            QMainWindow { background-color: #1e1e2e; }
-            QWidget { background-color: #1e1e2e; color: #cdd6f4; }
-            QScrollBar:vertical { background: #1e1e2e; width: 10px; }
-            QScrollBar::handle:vertical { background: #45475a; border-radius: 5px; }
-            QScrollBar:horizontal { background: #1e1e2e; height: 10px; }
-            QScrollBar::handle:horizontal { background: #45475a; border-radius: 5px; }
-            QScrollBar::add-line, QScrollBar::sub-line { height: 0px; width: 0px; }
-        """)
+        wrap = QWidget()
+        wl = QVBoxLayout(wrap)
+        wl.setContentsMargins(10, 10, 10, 10)
+        wl.addWidget(body)
+        return wrap
 
     # ---------- signal wiring ----------
     def _connect_signals(self):
@@ -162,6 +173,7 @@ class MainWindow(QMainWindow):
     # ---------- connection ----------
     def _on_connect(self, host: str, port: int):
         self.fleet.clear()
+        self._team_links = {}
         self.course_map.clear()
         self._sync_team_filter()
         self.refresh_views()
@@ -187,13 +199,18 @@ class MainWindow(QMainWindow):
         issues = validate_course(course)
         self.course_panel.update_course(course)
         self.course_map.set_course(course)
-        self.course_id_label.setText(f"Course: {course.course_id}")
+        name = course.course_id or "<no id>"
         if issues:
-            msg = f"Course {course.course_id or '<no id>'} INVALID: {issues[0]}"
+            set_chip(self.course_id_label, f"COURSE {name} · INVALID", theme.FAULT)
+            self.course_id_label.setToolTip("; ".join(issues))
+            msg = f"Course {name} INVALID: {issues[0]}"
             self.statusBar().showMessage(msg)
             self.log_panel.append_log(f"[ERROR] {msg}")
         else:
-            self.log_panel.append_log(f"[RxCourse] {course.course_id} valid")
+            set_chip(self.course_id_label, f"COURSE {name}", theme.TEXT_MUTED)
+            self.course_id_label.setToolTip(f"{course.pinger_freq_hz} Hz pinger, "
+                                            f"{len(course.corners)} corners")
+            self.log_panel.append_log(f"[RxCourse] {name} valid")
 
     def _on_report(self, team_id: str, vehicle_id: str, report):
         is_new = (team_id, vehicle_id) not in self.fleet.vehicles
@@ -223,10 +240,49 @@ class MainWindow(QMainWindow):
         return None if text in ("", ALL_TEAMS) else text
 
     def refresh_views(self):
+        now = time.time()
         team = self.selected_team()
-        self.course_map.show_fleet(self.fleet, team)
-        self.vehicle_monitor.refresh(self.fleet, team)
-        self.teams_panel.refresh(self.fleet)
+        self.course_map.show_fleet(self.fleet, team, now)
+        self.vehicle_monitor.refresh(self.fleet, team, now)
+        self.teams_panel.refresh(self.fleet, now)
+        self._log_link_changes(now)
+        self._refresh_header(team, now)
+
+    def _log_link_changes(self, now):
+        for tid in self.fleet.team_ids():
+            link, age = self.fleet.team_link(tid, now)
+            previous = self._team_links.get(tid)
+            if link == previous:
+                continue
+            self._team_links[tid] = link
+            if link == "LOST":
+                self.log_panel.append_log(
+                    f"[WARN] {tid} GCS link lost: no heartbeat for {format_age(age)}")
+            elif link == "UP" and previous == "LOST":
+                self.log_panel.append_log(f"{tid} GCS link restored")
+
+    def _refresh_header(self, team, now):
+        teams = [self.fleet.teams[t] for t in self.fleet.team_ids() if team in (None, t)]
+        if not teams:
+            set_chip(self.run_chip, "NO TEAMS", theme.IDLE)
+        elif len(teams) == 1:
+            t = teams[0]
+            run = t.run_state + (f" · RUN {t.run_id}" if t.run_id is not None else "")
+            link, age = self.fleet.team_link(t.team_id, now)
+            if link == "LOST":
+                set_chip(self.run_chip, f"{t.team_id} {run} · LINK LOST {format_age(age)}", theme.FAULT)
+            else:
+                set_chip(self.run_chip, f"{t.team_id} {run}", RUN_COLORS.get(t.run_state, theme.IDLE))
+        else:
+            set_chip(self.run_chip, f"{len(teams)} TEAMS", theme.TEXT_MUTED)
+
+        tracks = self.fleet.vehicles_of(team)
+        live = sum(1 for v in tracks if v.age(now) is not None and v.age(now) <= STALE_SECONDS)
+        if not tracks:
+            set_chip(self.live_chip, "0 LIVE", theme.IDLE)
+        else:
+            set_chip(self.live_chip, f"{live}/{len(tracks)} LIVE",
+                     theme.OK if live == len(tracks) else theme.WARN)
 
     def _sync_team_filter(self):
         known = [self.team_filter.itemText(i) for i in range(1, self.team_filter.count())]

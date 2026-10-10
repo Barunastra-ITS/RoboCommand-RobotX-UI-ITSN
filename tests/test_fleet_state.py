@@ -133,6 +133,18 @@ class TestValidation(unittest.TestCase):
         self.assertIn("ended task attempt SAFE_PASSAGE", end[0])
 
 
+class TestTeamLink(unittest.TestCase):
+    def test_link_follows_newest_heartbeat(self):
+        fleet = FleetState()
+        self.assertEqual(fleet.team_link(TEAM, now=100.0), ("NO DATA", None))
+        fleet.ingest_report(TEAM, "USV1", heartbeat(1), now=100.0)
+        fleet.ingest_report(TEAM, "UAV1", heartbeat(1, vehicle="UAV1"), now=90.0)
+        self.assertEqual(fleet.team_link(TEAM, now=101.0)[0], "UP")      # USV1 still fresh
+        state, age = fleet.team_link(TEAM, now=160.0)
+        self.assertEqual(state, "LOST")
+        self.assertAlmostEqual(age, 60.0)
+
+
 class TestRunState(unittest.TestCase):
     def test_declared_then_active(self):
         fleet = FleetState()

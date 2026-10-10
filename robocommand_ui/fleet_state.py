@@ -24,6 +24,8 @@ from robocommand_ui.proto_helper import rx_common_pb2, rx_task_name
 TRAIL_LENGTH = 1200          # 10 minutes at 2 Hz
 RATE_WINDOW_S = 5.0
 EXPECTED_HB_HZ = 2.0
+STALE_SECONDS = 2.5          # 2 Hz heartbeats: >2.5 s means several were missed
+OFFLINE_SECONDS = 30.0
 
 LatLng = Tuple[float, float]
 
@@ -132,6 +134,21 @@ class FleetState:
 
     def team_ids(self) -> List[str]:
         return sorted(self.teams)
+
+    def team_link(self, team_id: str, now: Optional[float] = None) -> Tuple[str, Optional[float]]:
+        """State of a team's GCS link, judged from its heartbeats.
+
+        MQTT clients can't see each other's connections, so the host can only
+        tell a GCS is gone when its heartbeats stop. Returns (state, age_s):
+        "UP" when any vehicle heartbeat is fresh, "LOST" when the newest is
+        older than STALE_SECONDS, "NO DATA" before any heartbeat.
+        """
+        now = time.time() if now is None else now
+        ages = [v.age(now) for v in self.vehicles_of(team_id) if v.last_hb is not None]
+        if not ages:
+            return "NO DATA", None
+        newest = min(ages)
+        return ("UP" if newest <= STALE_SECONDS else "LOST"), newest
 
     def vehicles_of(self, team_id: Optional[str] = None) -> List[VehicleTrack]:
         tracks = [v for v in self.vehicles.values() if team_id in (None, v.team_id)]

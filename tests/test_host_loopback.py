@@ -88,7 +88,7 @@ class TestHostLoopback(unittest.TestCase):
         row = self.win.teams_panel.row_text(TEAM)
         self.assertIsNotNone(row)
         self.assertEqual(row[1], "DECLARED")
-        self.assertEqual(row[3], "2/2")
+        self.assertEqual(row[2], "2/2")
         self.assertEqual([self.win.team_filter.itemText(i) for i in range(self.win.team_filter.count())],
                          ["All teams", TEAM])
 
@@ -106,9 +106,9 @@ class TestHostLoopback(unittest.TestCase):
         card = self.win.vehicle_monitor.card(TEAM, "UAV1")
         self.assertIsNotNone(card)
         self.assertEqual(card.status_label.text(), "ACTIVE")
-        self.assertEqual(card._values["State:"].text(), "AUTO")
-        self.assertEqual(card._values["Flight phase:"].text(), "AIRBORNE")
-        self.assertIn("Hz", card._values["Rate:"].text())
+        self.assertEqual(card._values["State"].text(), "AUTO")
+        self.assertEqual(card._values["Flight"].text(), "AIRBORNE")
+        self.assertIn("Hz", card.rate.value.text())
 
     def test_5_run_start_seen_by_both_sides(self):
         cmd = rx_commands_pb2.RxCommand(team_id=TEAM, seq=1, sent_at=now_ts(),
@@ -119,7 +119,7 @@ class TestHostLoopback(unittest.TestCase):
         self.win.refresh_views()
         self.assertEqual(self.reporter.run_id, 42)
         row = self.win.teams_panel.row_text(TEAM)
-        self.assertEqual((row[1], row[5]), ("ACTIVE", "42"))
+        self.assertEqual((row[1], row[4]), ("ACTIVE", "42"))
 
     def test_6_task_report_drawn_on_map(self):
         sp = rx_reports_pb2.SafePassageReport(
@@ -158,6 +158,20 @@ class TestHostLoopback(unittest.TestCase):
         drain(0.1)
         self.assertEqual(list(self.win.course_map._canvas._vehicles), ["RNRX/USV1"])
         self.assertIsNone(self.win.vehicle_monitor.card(TEAM, "USV1"))
+        self.win.team_filter.setCurrentText("All teams")
+
+    def test_9b_gcs_link_loss_is_shown(self):
+        self.reporter.stop()                    # GCS goes away: heartbeats stop
+        for v in self.win.fleet.vehicles_of(TEAM):
+            v.last_hb_time -= 120               # as if two minutes have passed
+        self.win.team_filter.setCurrentText(TEAM)
+        self.win.refresh_views()
+        row = self.win.teams_panel.row_text(TEAM)
+        self.assertTrue(row[2].startswith("LOST 2m"), row)
+        self.assertIn("LINK LOST", self.win.run_chip.text())
+        self.assertIn(f"[WARN] {TEAM} GCS link lost", self.log_text())
+        self.assertEqual(self.win.vehicle_monitor.card(TEAM, "USV1").status_label.text(), "OFFLINE")
+        self.assertIn("Broker", self.win.connection_bar.status_label.text())
         self.win.team_filter.setCurrentText("All teams")
 
     def test_9_host_never_publishes(self):

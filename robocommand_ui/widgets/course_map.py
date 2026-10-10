@@ -1,132 +1,87 @@
-"""Course map visualization.
+"""Top-down course map: what teams report, drawn in local metres.
 
-Renders the standard RobotX 2026 course schematic (pontoons + UAV L/R, Safe
-Passage buoy field, pipeline, Coordinated Logistics platform, seawall) scaled
-to fit the received RxCourse boundary, then overlays what teams report to
-this host: each vehicle's position, heading and movement trail (labelled
-TEAM/VEHICLE), the declared UAV geofence, and the latest task reports (Safe
-Passage buoys with beacon states, the pipeline survey).
+Only reported data is drawn: the RxCourse boundary, each team's declared UAV
+geofence, every vehicle's position, heading and fading trail (labelled
+TEAM/VEHICLE, dimmed when its heartbeats go stale), and the latest Task 1
+buoys / Task 2 pipeline reports. Positions are projected to metres around
+the course so the grid and scale bar are true distances.
 
-Only the boundary polygon comes from the wire. The schematic elements are the
-standardized course layout and are drawn as a labeled context layer; the live
-points are drawn at their real lat/lng.
+Mouse: wheel zooms about the cursor, drag pans, double-click re-fits.
 """
 
 import math
+import time
+from typing import Dict, List, Optional, Tuple
 
-from PyQt5.QtWidgets import QGroupBox, QVBoxLayout, QHBoxLayout, QLabel, QWidget, QCheckBox
-from PyQt5.QtCore import Qt, QPointF, QRectF
-from PyQt5.QtGui import QPainter, QPen, QBrush, QColor, QPolygonF, QFont
+from PyQt5.QtCore import QPointF, QRectF, Qt
+from PyQt5.QtGui import QBrush, QFontMetrics, QPainter, QPainterPath, QPen, QPolygonF
+from PyQt5.QtWidgets import QPushButton, QWidget
 
-STYLE = """
-    QGroupBox {
-        font-weight: bold;
-        color: #cdd6f4;
-        border: 1px solid #45475a;
-        border-radius: 6px;
-        margin-top: 8px;
-        padding: 12px 8px 8px 8px;
-    }
-    QGroupBox::title {
-        subcontrol-origin: margin;
-        left: 12px;
-        padding: 0 4px;
-    }
-    QLabel { color: #6c7086; font-style: italic; font-size: 11px; }
-    QCheckBox { color: #cdd6f4; font-size: 11px; }
-"""
+from robocommand_ui import theme
+from robocommand_ui.fleet_state import STALE_SECONDS
+from robocommand_ui.proto_helper import rx_common_pb2, vehicle_type_name
+from robocommand_ui.widgets.panel import Panel
 
-# --- palette -------------------------------------------------------------
-WATER = QColor(0xa9, 0xc6, 0xd9)          # reference light-blue water
-WATER_GRID = QColor(0x93, 0xb3, 0xc9)
-BOUNDARY = QColor(0x25, 0x3b, 0x52)
-GEOFENCE = QColor(0xf9, 0xe2, 0x17)       # amber dashed UAV geofence
-SCHEMATIC = QColor(0x8a, 0x7f, 0x6e)      # tan platform / pontoons
-PONT = QColor(0x2f, 0x5f, 0x8a)
-SEA = QColor(0x33, 0x3f, 0x4f)
-BUOY_BODY = QColor(0xf4, 0xf6, 0xf8)
-BUOY_EDGE = QColor(0x55, 0x60, 0x6b)
-TEXT = QColor(0x25, 0x3b, 0x52)
+LatLng = Tuple[float, float]
+M_PER_DEG_LAT = 111_320.0
+GRID_STEPS_M = (1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000)
+MIN_GRID_PX = 64
+FIT_MARGIN = 0.12
 
-VEHICLE_COLORS = {
-    "USV": QColor(0x4c, 0xaf, 0x50),
-    "UUV": QColor(0x21, 0x96, 0xf3),
-    "UAV": QColor(0xff, 0xa0, 0x00),
+# Real-world buoy beacon colours (data, not UI status)
+BEACONS = {
+    rx_common_pb2.BEACON_STATE_FLASHING_RED: ("#EF4444", True),
+    rx_common_pb2.BEACON_STATE_FLASHING_GREEN: ("#22C55E", True),
+    rx_common_pb2.BEACON_STATE_FLASHING_BLUE: ("#3B82F6", True),
+    rx_common_pb2.BEACON_STATE_STEADY_BLUE: ("#3B82F6", False),
+    rx_common_pb2.BEACON_STATE_OFF: ("#64748B", False),
 }
-UNKNOWN_COLOR = QColor(0x9e, 0x9e, 0x9e)
-
-# beacon state -> (color, is_flashing)
-from robocommand_ui.proto_helper import rx_common_pb2
-
-_BEACON = {
-    rx_common_pb2.BEACON_STATE_FLASHING_RED: (QColor(0xe5, 0x39, 0x35), True),
-    rx_common_pb2.BEACON_STATE_FLASHING_GREEN: (QColor(0x4c, 0xaf, 0x50), True),
-    rx_common_pb2.BEACON_STATE_FLASHING_BLUE: (QColor(0x1e, 0x88, 0xe5), True),
-    rx_common_pb2.BEACON_STATE_STEADY_BLUE: (QColor(0x1e, 0x88, 0xe5), False),
-    rx_common_pb2.BEACON_STATE_OFF: (QColor(0x9e, 0x9e, 0x9e), False),
+SEGMENTS = {
+    rx_common_pb2.PIPELINE_SEGMENT_INTACT: theme.OK,
+    rx_common_pb2.PIPELINE_SEGMENT_DAMAGED: theme.FAULT,
 }
-_SEGMENT = {
-    rx_common_pb2.PIPELINE_SEGMENT_INTACT: QColor(0x4c, 0xaf, 0x50),
-    rx_common_pb2.PIPELINE_SEGMENT_DAMAGED: QColor(0xe5, 0x39, 0x35),
-}
-_SEGMENT_DEFAULT = QColor(0x9e, 0x9e, 0x9e)
 
 
-def _type_key(hb) -> str:
-    try:
-        from robocommand_ui.proto_helper import vehicle_type_name
-        return vehicle_type_name(hb.vehicle_type)
-    except Exception:
-        return "UNKNOWN"
-
-
-class CourseMapWidget(QGroupBox):
+class CourseMapWidget(Panel):
     def __init__(self, parent=None):
-        super().__init__("Course Map (top-down)", parent)
-        self.setStyleSheet(STYLE)
-        self.setMinimumHeight(420)
-
-        layout = QVBoxLayout(self)
-
+        super().__init__("Course map", parent, body_margins=(0, 0, 0, 0))
         self._canvas = MapCanvas(self)
-        self._canvas.setMinimumHeight(360)
+        self.body.addWidget(self._canvas, 1)
 
-        # toolbar
-        tb = QHBoxLayout()
-        tb.addWidget(QLabel("Reported positions and trails, labelled TEAM/VEHICLE."))
-        tb.addStretch()
-        self.schematic_chk = QCheckBox("schematic")
-        self.schematic_chk.setChecked(True)
-        self.schematic_chk.toggled.connect(self._canvas.set_schematic)
-        tb.addWidget(self.schematic_chk)
-        layout.addLayout(tb)
+        self.trails_btn = QPushButton("Trails")
+        self.trails_btn.setObjectName("Ghost")
+        self.trails_btn.setCheckable(True)
+        self.trails_btn.setChecked(True)
+        self.trails_btn.setCursor(Qt.PointingHandCursor)
+        self.trails_btn.setToolTip("Show each vehicle's reported track")
+        self.trails_btn.toggled.connect(self._canvas.set_show_trails)
+        self.actions.addWidget(self.trails_btn)
 
-        layout.addWidget(self._canvas)
-
-        self._empty_label = QLabel("No course received yet.")
-        self._empty_label.setAlignment(Qt.AlignCenter)
-        layout.addWidget(self._empty_label)
+        fit_btn = QPushButton("Fit")
+        fit_btn.setObjectName("Ghost")
+        fit_btn.setCursor(Qt.PointingHandCursor)
+        fit_btn.setToolTip("Fit the course (or double-click the map)")
+        fit_btn.clicked.connect(self._canvas.reset_view)
+        self.actions.addWidget(fit_btn)
 
     def set_course(self, course):
         self._canvas.set_course_points(
-            [(c.latitude, c.longitude) for c in course.corners],
-            course.course_id)
-        self._empty_label.hide()
-        self.update()
+            [(c.latitude, c.longitude) for c in course.corners], course.course_id)
+        self._update_meta()
 
-    def set_geofence(self, points):
-        self._canvas.set_geofence(points)
-        self.update()
-
-    def show_fleet(self, fleet, team_filter=None):
+    def show_fleet(self, fleet, team_filter=None, now: Optional[float] = None):
         """Draw every reporting vehicle (or one team's) from a FleetState."""
+        now = time.time() if now is None else now
         c = self._canvas
-        c.clear_vehicles()
-        c.clear_task_data()
+        vehicles = {}
         for v in fleet.vehicles_of(team_filter):
             if v.last_hb is not None and v.last_hb.HasField("position"):
-                c.set_vehicle(f"{v.team_id}/{v.vehicle_id}", v.last_hb, list(v.trail))
+                stale = (now - v.last_hb_time) > STALE_SECONDS
+                vehicles[f"{v.team_id}/{v.vehicle_id}"] = (v.last_hb, list(v.trail), stale)
+        c.set_vehicles(vehicles)
+
         teams = [fleet.teams[t] for t in fleet.team_ids() if team_filter in (None, t)]
+        c.clear_task_data()
         c.set_geofence([])
         # Geofence and task overlays belong to one team; only one runs per course
         if len(teams) == 1:
@@ -136,331 +91,345 @@ class CourseMapWidget(QGroupBox):
                 c.set_safe_passage(*team.safe_passage)
             if team.pipeline:
                 c.set_pipeline(*team.pipeline)
+        self._update_meta()
         c.update()
 
     def clear(self):
-        self._canvas.clear_vehicles()
+        self._canvas.set_vehicles({})
         self._canvas.clear_task_data()
         self._canvas.set_geofence([])
+        self._update_meta()
         self._canvas.update()
+
+    def _update_meta(self):
+        c = self._canvas
+        parts = []
+        if c._course_id:
+            parts.append(c._course_id)
+        n = len(c._vehicles)
+        parts.append(f"{n} vehicle{'s' if n != 1 else ''}")
+        self.set_meta("  ·  ".join(parts))
 
 
 class MapCanvas(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setMinimumHeight(320)
-        self.setStyleSheet("background-color: #0f1824; border-radius: 4px;")
-        self._course_points = []
-        self._geofence_points = []
-        self._vehicles = {}        # label -> (heartbeat, trail [(lat, lng)])
+        self.setMinimumSize(420, 320)
+        self.setMouseTracking(True)
+        self.setCursor(Qt.OpenHandCursor)
+        self._course_points: List[LatLng] = []
+        self._geofence_points: List[LatLng] = []
+        self._vehicles: Dict[str, tuple] = {}     # label -> (heartbeat, trail, stale)
         self._course_id = ""
-        self._show_schematic = True
-        self._sp_entry = None      # (lat, lng)
-        self._sp_exit = None
-        self._sp_buoys = []        # list[(lat,lng,state)]
-        self._pl_active = None     # (lat,lng)
-        self._pl_segments = []
+        self._sp_entry: Optional[LatLng] = None
+        self._sp_exit: Optional[LatLng] = None
+        self._sp_buoys: List[Tuple[float, float, int]] = []
+        self._pl_active: Optional[LatLng] = None
+        self._pl_segments: List[int] = []
+        self._show_trails = True
+        # view: local metres -> pixels
+        self._origin: Optional[LatLng] = None
+        self._scale = 1.0                     # px per metre
+        self._center_m = (0.0, 0.0)           # metres at widget centre
+        self._user_view = False
+        self._drag_from: Optional[QPointF] = None
 
-    # --- data setters ---
-    def set_schematic(self, on: bool):
-        self._show_schematic = on
+    # ---------------- data ----------------
+    def set_course_points(self, points, course_id=""):
+        self._course_points = list(points)
+        self._course_id = course_id
+        self._origin = None
+        self._user_view = False
         self.update()
 
-    def set_course_points(self, points, course_id=""):
-        self._course_points = points
-        self._course_id = course_id
-
     def set_geofence(self, points):
-        self._geofence_points = points
+        self._geofence_points = list(points)
 
-    def set_vehicle(self, label, heartbeat, trail=()):
-        self._vehicles[label] = (heartbeat, trail)
-
-    def clear_vehicles(self):
-        self._vehicles.clear()
+    def set_vehicles(self, vehicles):
+        self._vehicles = dict(vehicles)
 
     def set_safe_passage(self, entry, exit_pos, buoys):
-        self._sp_entry = entry
-        self._sp_exit = exit_pos
-        self._sp_buoys = buoys
+        self._sp_entry, self._sp_exit, self._sp_buoys = entry, exit_pos, list(buoys)
 
     def set_pipeline(self, active, segments):
-        self._pl_active = active
-        self._pl_segments = segments
+        self._pl_active, self._pl_segments = active, list(segments)
 
     def clear_task_data(self):
-        self._sp_entry = None
-        self._sp_exit = None
-        self._sp_buoys = []
-        self._pl_active = None
-        self._pl_segments = []
+        self._sp_entry = self._sp_exit = self._pl_active = None
+        self._sp_buoys, self._pl_segments = [], []
 
-    # --- geometry helpers ---
-    def _all_points(self):
+    def set_show_trails(self, on: bool):
+        self._show_trails = on
+        self.update()
+
+    def reset_view(self):
+        self._user_view = False
+        self.update()
+
+    # ---------------- projection ----------------
+    def _ensure_origin(self) -> bool:
+        if self._origin is None:
+            pts = self._course_points or [
+                (hb.position.latitude, hb.position.longitude) for hb, _, _ in self._vehicles.values()]
+            if not pts:
+                return False
+            self._origin = (sum(p[0] for p in pts) / len(pts), sum(p[1] for p in pts) / len(pts))
+        return True
+
+    def to_m(self, lat: float, lng: float) -> Tuple[float, float]:
+        lat0, lng0 = self._origin
+        return ((lng - lng0) * M_PER_DEG_LAT * math.cos(math.radians(lat0)),
+                (lat - lat0) * M_PER_DEG_LAT)
+
+    def to_px(self, lat: float, lng: float) -> QPointF:
+        x, y = self.to_m(lat, lng)
+        return self._m_to_px(x, y)
+
+    def _m_to_px(self, x: float, y: float) -> QPointF:
+        cx, cy = self._center_m
+        return QPointF(self.width() / 2 + (x - cx) * self._scale,
+                       self.height() / 2 - (y - cy) * self._scale)
+
+    def _px_to_m(self, p: QPointF) -> Tuple[float, float]:
+        cx, cy = self._center_m
+        return (cx + (p.x() - self.width() / 2) / self._scale,
+                cy - (p.y() - self.height() / 2) / self._scale)
+
+    def _fit(self):
         pts = list(self._course_points) + list(self._geofence_points)
-        for hb, _ in self._vehicles.values():
-            pts.append((hb.position.latitude, hb.position.longitude))
-        if self._sp_entry:
-            pts.append(self._sp_entry)
-        if self._sp_exit:
-            pts.append(self._sp_exit)
-        for b in self._sp_buoys:
-            pts.append((b[0], b[1]))
-        if self._pl_active:
-            pts.append(self._pl_active)
-        return pts
+        if not pts:
+            pts = [(hb.position.latitude, hb.position.longitude) for hb, _, _ in self._vehicles.values()]
+        ms = [self.to_m(a, b) for a, b in pts]
+        xs, ys = [m[0] for m in ms], [m[1] for m in ms]
+        w = max(max(xs) - min(xs), 20.0)
+        h = max(max(ys) - min(ys), 20.0)
+        self._center_m = ((max(xs) + min(xs)) / 2, (max(ys) + min(ys)) / 2)
+        self._scale = min(self.width() / (w * (1 + 2 * FIT_MARGIN)),
+                          self.height() / (h * (1 + 2 * FIT_MARGIN)))
 
+    # ---------------- interaction ----------------
+    def wheelEvent(self, e):
+        if self._origin is None:
+            return
+        before = self._px_to_m(e.pos())
+        factor = 1.0015 ** e.angleDelta().y()
+        self._scale = max(0.05, min(self._scale * factor, 400.0))
+        after = self._px_to_m(e.pos())
+        cx, cy = self._center_m
+        self._center_m = (cx + before[0] - after[0], cy + before[1] - after[1])
+        self._user_view = True
+        self.update()
+
+    def mousePressEvent(self, e):
+        if e.button() == Qt.LeftButton:
+            self._drag_from = QPointF(e.pos())
+            self.setCursor(Qt.ClosedHandCursor)
+
+    def mouseMoveEvent(self, e):
+        if self._drag_from is not None:
+            d = QPointF(e.pos()) - self._drag_from
+            cx, cy = self._center_m
+            self._center_m = (cx - d.x() / self._scale, cy + d.y() / self._scale)
+            self._drag_from = QPointF(e.pos())
+            self._user_view = True
+            self.update()
+
+    def mouseReleaseEvent(self, e):
+        self._drag_from = None
+        self.setCursor(Qt.OpenHandCursor)
+
+    def mouseDoubleClickEvent(self, e):
+        self.reset_view()
+
+    # ---------------- painting ----------------
     def paintEvent(self, event):
         p = QPainter(self)
         p.setRenderHint(QPainter.Antialiasing)
-        p.fillRect(self.rect(), WATER)
+        path = QPainterPath()
+        path.addRoundedRect(QRectF(self.rect()), theme.RADIUS, theme.RADIUS)
+        p.setClipPath(path)
+        p.fillRect(self.rect(), theme.qcolor(theme.MAP_WATER))
 
-        points = self._all_points()
-        if not points:
-            p.setPen(QColor(0x6c, 0x70, 0x86))
-            p.drawText(self.rect(), Qt.AlignCenter, "Awaiting RxCourse")
+        if not self._ensure_origin():
+            self._draw_empty(p)
             return
+        if not self._user_view:
+            self._fit()
 
-        lats = [pt[0] for pt in points]
-        lngs = [pt[1] for pt in points]
-        min_lat, max_lat = min(lats), max(lats)
-        min_lng, max_lng = min(lngs), max(lngs)
-        span_lat = max(max_lat - min_lat, 1e-5)
-        span_lng = max(max_lng - min_lng, 1e-5)
-        min_lat -= span_lat * 0.12
-        max_lat += span_lat * 0.12
-        min_lng -= span_lng * 0.12
-        max_lng += span_lng * 0.12
+        self._draw_grid(p)
+        self._draw_boundary(p)
+        self._draw_geofence(p)
+        self._draw_tasks(p)
+        if self._show_trails:
+            self._draw_trails(p)
+        self._draw_vehicles(p)
+        self._draw_scale_and_north(p)
+        self._draw_legend(p)
 
-        w = self.width() - 24
-        h = self.height() - 24
-        if w <= 0 or h <= 0:
-            return
-        lat_scale = math.cos(math.radians((min_lat + max_lat) / 2.0))
-        data_w = (max_lng - min_lng) * lat_scale
-        data_h = max_lat - min_lat
-        if data_w <= 0 or data_h <= 0:
-            return
-        scale = min(w / data_w, h / data_h)
-        off_x = 12 + (w - data_w * scale) / 2.0
-        off_y = 12 + (h - data_h * scale) / 2.0
+    def _draw_empty(self, p):
+        p.setPen(theme.qcolor(theme.TEXT_MUTED))
+        p.setFont(theme.ui_font(12, 600))
+        r = QRectF(self.rect())
+        p.drawText(r.adjusted(0, -14, 0, -14), Qt.AlignCenter, "Waiting for RxCourse")
+        p.setPen(theme.qcolor(theme.TEXT_FAINT))
+        p.setFont(theme.ui_font(9))
+        p.drawText(r.adjusted(0, 16, 0, 16), Qt.AlignCenter,
+                   "The course boundary appears when RoboCommand publishes it")
 
-        def scr(lat, lng):
-            return QPointF(off_x + (lng - min_lng) * lat_scale * scale,
-                           off_y + (max_lat - lat) * scale)
+    def _grid_step(self) -> float:
+        for step in GRID_STEPS_M:
+            if step * self._scale >= MIN_GRID_PX:
+                return step
+        return GRID_STEPS_M[-1]
 
-        # bbox of the course (screen) for schematic placement
-        if self._course_points:
-            cp = [scr(a, b) for a, b in self._course_points]
-            bbox = (min(q.x() for q in cp), min(q.y() for q in cp),
-                    max(q.x() for q in cp), max(q.y() for q in cp))
-        else:
-            bbox = (off_x, off_y, off_x + data_w * scale, off_y + data_h * scale)
-        bx0, by0, bx1, by1 = bbox
-        bw, bh = bx1 - bx0, by1 - by0
-
-        # --- schematic context (standard course layout) ---
-        if self._show_schematic:
-            self._draw_schematic(p, bbox)
-
-        # --- water grid ---
-        p.setPen(QPen(WATER_GRID, 1))
-        step = 40
-        gx = int(off_x)
-        while gx < self.width() - 12:
-            p.drawLine(QPointF(gx, off_y), QPointF(gx, off_y + data_h * scale))
+    def _draw_grid(self, p):
+        step = self._grid_step()
+        x0, y1 = self._px_to_m(QPointF(0, 0))
+        x1, y0 = self._px_to_m(QPointF(self.width(), self.height()))
+        p.setPen(QPen(theme.qcolor(theme.MAP_GRID), 1))
+        gx = math.floor(x0 / step) * step
+        while gx <= x1:
+            q = self._m_to_px(gx, 0)
+            p.drawLine(QPointF(q.x(), 0), QPointF(q.x(), self.height()))
             gx += step
-        gy = int(off_y)
-        while gy < self.height() - 12:
-            p.drawLine(QPointF(off_x, gy), QPointF(off_x + data_w * scale, gy))
+        gy = math.floor(y0 / step) * step
+        while gy <= y1:
+            q = self._m_to_px(0, gy)
+            p.drawLine(QPointF(0, q.y()), QPointF(self.width(), q.y()))
             gy += step
 
-        # --- boundary polygon ---
-        if len(self._course_points) >= 3:
-            poly = QPolygonF([scr(a, b) for a, b in self._course_points])
-            p.setBrush(QBrush(QColor(0x66, 0x99, 0xcc, 60)))
-            p.setPen(QPen(BOUNDARY, 2.5))
-            p.drawPolygon(poly)
-            p.setPen(QPen(BOUNDARY, 1))
-            for i, (a, b) in enumerate(self._course_points[:-1]):
-                q = scr(a, b)
-                p.setBrush(QBrush(BOUNDARY))
-                p.drawEllipse(q, 2, 2)
+    def _draw_boundary(self, p):
+        if len(self._course_points) < 3:
+            return
+        poly = QPolygonF([self.to_px(a, b) for a, b in self._course_points])
+        p.setBrush(QBrush(theme.qcolor(theme.MAP_BOUNDARY, 14)))
+        p.setPen(QPen(theme.qcolor(theme.MAP_BOUNDARY, 200), 1.6))
+        p.drawPolygon(poly)
+        p.setBrush(QBrush(theme.qcolor(theme.MAP_BOUNDARY)))
+        p.setPen(Qt.NoPen)
+        for a, b in self._course_points[:-1]:
+            p.drawEllipse(self.to_px(a, b), 2.5, 2.5)
 
-        # --- safe passage (Task 1) ---
-        for b in self._sp_buoys:
-            color, flashing = _BEACON.get(b[2], (QColor(0x9e, 0x9e, 0x9e), False))
-            self._draw_buoy(p, scr(b[0], b[1]), color, flashing, 9)
-        if self._sp_entry:
-            self._draw_ring_marker(p, scr(*self._sp_entry), QColor(0x1e, 0x88, 0xe5), "ENTRY")
-        if self._sp_exit:
-            self._draw_ring_marker(p, scr(*self._sp_exit), QColor(0x1e, 0x88, 0xe5), "EXIT")
+    def _draw_geofence(self, p):
+        if len(self._geofence_points) < 3:
+            return
+        poly = QPolygonF([self.to_px(a, b) for a, b in self._geofence_points])
+        p.setBrush(QBrush(theme.qcolor(theme.MAP_GEOFENCE, 18)))
+        pen = QPen(theme.qcolor(theme.MAP_GEOFENCE, 210), 1.4, Qt.DashLine)
+        pen.setDashPattern([6, 4])
+        p.setPen(pen)
+        p.drawPolygon(poly)
 
-        # --- pipeline (Task 2) ---
-        if self._pl_active:
-            q = scr(*self._pl_active)
-            color, _ = _BEACON[rx_common_pb2.BEACON_STATE_FLASHING_GREEN]
-            self._draw_buoy(p, q, color, True, 9)
-            # segments as a schematic chain from the active buoy
-            for i, seg in enumerate(self._pl_segments):
-                sq = QPointF(q.x(), q.y() + 16 + i * 15)
-                c = _SEGMENT.get(seg, _SEGMENT_DEFAULT)
+    def _draw_tasks(self, p):
+        for lat, lng, state in self._sp_buoys:
+            color, flashing = BEACONS.get(state, (theme.TEXT_FAINT, False))
+            q = self.to_px(lat, lng)
+            if flashing:
                 p.setPen(Qt.NoPen)
-                p.setBrush(QBrush(c))
-                p.drawEllipse(sq, 5, 5)
+                p.setBrush(QBrush(theme.qcolor(color, 60)))
+                p.drawEllipse(q, 10, 10)
+            p.setPen(QPen(theme.qcolor(theme.BG), 1.5))
+            p.setBrush(QBrush(theme.qcolor(color)))
+            p.drawEllipse(q, 5, 5)
+        for point, label in ((self._sp_entry, "ENTRY"), (self._sp_exit, "EXIT")):
+            if point:
+                q = self.to_px(*point)
+                p.setPen(QPen(theme.qcolor(theme.INFO), 1.6))
+                p.setBrush(Qt.NoBrush)
+                p.drawEllipse(q, 9, 9)
+                p.setFont(theme.mono_font(7.5, 700))
+                p.drawText(QPointF(q.x() + 12, q.y() - 8), label)
+        if self._pl_active:
+            q = self.to_px(*self._pl_active)
+            p.setPen(QPen(theme.qcolor(theme.BG), 1.5))
+            p.setBrush(QBrush(theme.qcolor(theme.OK)))
+            p.drawEllipse(q, 6, 6)
+            for i, seg in enumerate(self._pl_segments):
+                p.setBrush(QBrush(theme.qcolor(SEGMENTS.get(seg, theme.TEXT_FAINT))))
+                p.drawEllipse(QPointF(q.x() + 14 + i * 12, q.y()), 4, 4)
 
-        # --- UAV geofence ---
-        if len(self._geofence_points) >= 3:
-            poly = QPolygonF([scr(a, b) for a, b in self._geofence_points])
-            p.setBrush(QBrush(QColor(0xff, 0xa0, 0x00, 40)))
-            p.setPen(QPen(GEOFENCE, 2, Qt.DashLine))
-            p.drawPolygon(poly)
-
-        # --- vehicle trails (movement history) ---
-        for hb, trail in self._vehicles.values():
+    def _draw_trails(self, p):
+        for hb, trail, stale in self._vehicles.values():
             if len(trail) < 2:
                 continue
-            color = QColor(VEHICLE_COLORS.get(_type_key(hb), UNKNOWN_COLOR))
-            color.setAlpha(150)
-            p.setPen(QPen(color, 2))
-            p.setBrush(Qt.NoBrush)
-            p.drawPolyline(QPolygonF([scr(a, b) for a, b in trail]))
+            color = theme.type_color(vehicle_type_name(hb.vehicle_type))
+            pts = [self.to_px(a, b) for a, b in trail]
+            n = len(pts)
+            for i in range(1, n):
+                alpha = int(25 + 150 * (i / n))          # older = fainter
+                if stale:
+                    alpha //= 2
+                p.setPen(QPen(theme.qcolor(color, alpha), 2, Qt.SolidLine, Qt.RoundCap))
+                p.drawLine(pts[i - 1], pts[i])
 
-        # --- vehicles (top layer) ---
-        for vid, (hb, _) in self._vehicles.items():
-            key = _type_key(hb)
-            color = VEHICLE_COLORS.get(key, UNKNOWN_COLOR)
-            q = scr(hb.position.latitude, hb.position.longitude)
-            p.setPen(QPen(QColor(0x11, 0x11, 0x1b), 2))
-            p.setBrush(QBrush(color))
-            p.drawEllipse(q, 6, 6)
-            hr = math.radians(hb.heading_deg)
-            vx, vy = math.sin(hr) * 22, -math.cos(hr) * 22
-            p.setPen(QPen(color, 2))
-            p.drawLine(q, QPointF(q.x() + vx, q.y() + vy))
-            p.setPen(QPen(TEXT))
-            p.setFont(QFont(QFont().family(), 7, QFont.Bold))
-            p.drawText(int(q.x() + 10), int(q.y() + 4), vid)
+    def _draw_vehicles(self, p):
+        fm = QFontMetrics(theme.mono_font(8, 600))
+        for label, (hb, _, stale) in sorted(self._vehicles.items()):
+            color = theme.type_color(vehicle_type_name(hb.vehicle_type))
+            q = self.to_px(hb.position.latitude, hb.position.longitude)
+            alpha = 110 if stale else 255
+            # heading arrow
+            h = math.radians(hb.heading_deg)
+            fwd = QPointF(math.sin(h), -math.cos(h))
+            side = QPointF(-fwd.y(), fwd.x())
+            arrow = QPolygonF([q + fwd * 11, q - fwd * 7 + side * 7, q - fwd * 3, q - fwd * 7 - side * 7])
+            p.setPen(QPen(theme.qcolor(theme.BG, alpha), 2))
+            p.setBrush(QBrush(theme.qcolor(color, alpha)))
+            p.drawPolygon(arrow)
+            if stale:
+                pen = QPen(theme.qcolor(theme.WARN, 200), 1.2, Qt.DashLine)
+                p.setPen(pen)
+                p.setBrush(Qt.NoBrush)
+                p.drawEllipse(q, 15, 15)
+            # label chip
+            text = label + ("  STALE" if stale else "")
+            w = fm.horizontalAdvance(text) + 12
+            r = QRectF(q.x() + 14, q.y() - 22, w, 18)
+            p.setPen(QPen(theme.qcolor(color, 140 if not stale else 70), 1))
+            p.setBrush(QBrush(theme.qcolor(theme.SURFACE, 225)))
+            p.drawRoundedRect(r, 4, 4)
+            p.setPen(theme.qcolor(theme.WARN if stale else theme.TEXT))
+            p.setFont(theme.mono_font(8, 600))
+            p.drawText(r, Qt.AlignCenter, text)
 
-        # --- legend + course id ---
-        self._draw_legend(p)
-        if self._course_id:
-            p.setPen(QPen(TEXT))
-            p.setFont(QFont(QFont().family(), 8, QFont.Bold))
-            p.drawText(8, 14, f"Course: {self._course_id}")
-            p.setFont(QFont(QFont().family(), 6))
-            p.setPen(QPen(QColor(0x44, 0x55, 0x66)))
-            p.drawText(8, 26, "reported positions and trails over standard course schematic")
-
-    # --- drawing helpers ---
-    def _draw_buoy(self, p, c, color, flashing, size):
-        # body: white trapezoid (wider at bottom)
-        w = size
-        h = size + 2
-        top = QPointF(c.x() - w * 0.55, c.y() - h * 0.5)
-        bot_l = QPointF(c.x() - w * 0.95, c.y() + h * 0.6)
-        bot_r = QPointF(c.x() + w * 0.95, c.y() + h * 0.6)
-        top_r = QPointF(c.x() + w * 0.55, c.y() - h * 0.5)
-        body = QPolygonF([bot_l, bot_r, top_r, top])
-        p.setPen(QPen(BUOY_EDGE, 1.2))
-        p.setBrush(QBrush(BUOY_BODY))
-        p.drawPolygon(body)
-        # beacon
+    def _draw_scale_and_north(self, p):
+        step = self._grid_step()
+        length = step * self._scale
+        x, y = 16, self.height() - 18
+        p.setPen(QPen(theme.qcolor(theme.TEXT_MUTED), 1.5))
+        p.drawLine(QPointF(x, y), QPointF(x + length, y))
+        p.drawLine(QPointF(x, y - 4), QPointF(x, y + 1))
+        p.drawLine(QPointF(x + length, y - 4), QPointF(x + length, y + 1))
+        p.setFont(theme.mono_font(8))
+        p.drawText(QPointF(x, y - 7), f"{step:g} m")
+        # north marker
+        nx, ny = self.width() - 22, 26
         p.setPen(Qt.NoPen)
-        p.setBrush(QBrush(color))
-        p.drawEllipse(QPointF(c.x(), c.y() - h * 0.6), size * 0.42, size * 0.42)
-        if flashing:
-            p.setPen(QPen(color, 1))
-            for ang in range(0, 360, 45):
-                a = math.radians(ang)
-                r1, r2 = size * 0.6, size * 0.95
-                p.drawLine(
-                    QPointF(c.x() + math.cos(a) * r1, c.y() - h * 0.6 + math.sin(a) * r1),
-                    QPointF(c.x() + math.cos(a) * r2, c.y() - h * 0.6 + math.sin(a) * r2))
-
-    def _draw_ring_marker(self, p, c, color, label):
-        p.setPen(QPen(color, 2))
-        for r in (8, 12):
-            p.drawEllipse(c, r, r)
-        p.setPen(QPen(color))
-        p.setFont(QFont(QFont().family(), 6, QFont.Bold))
-        p.drawText(int(c.x() + 14), int(c.y() - 6), label)
-
-    def _draw_schematic(self, p, bbox):
-        bx0, by0, bx1, by1 = bbox
-        bw, bh = bx1 - bx0, by1 - by0
-
-        def fx(frac_x, frac_y):
-            return QPointF(bx0 + bw * frac_x, by0 + bh * frac_y)
-
-        # Pontoons strip along the top
-        p.setPen(QPen(PONT, 2))
-        p.setBrush(QBrush(PONT))
-        p.drawRect(QRectF(fx(0.0, 0.0), QPointF(fx(1.0, 0.06).x(), fx(0.0, 0.06).y())))
-        p.setPen(QPen(QColor(0xf4, 0xf6, 0xf8)))
-        p.setFont(QFont(QFont().family(), 6, QFont.Bold))
-        p.drawText(int(fx(0.5, 0.0).x() - 24), int(fx(0.5, 0.0).y() + 8), "PONTTONS")
-
-        # UAV L/R pad top-left
-        pad = 16
-        p.setPen(QPen(SEA, 1.5))
-        p.setBrush(QBrush(QColor(0xcf, 0xd8, 0xe0)))
-        p.drawRect(QRectF(fx(0.04, 0.08), QPointF(fx(0.04, 0.08).x() + pad,
-                                                  fx(0.04, 0.08).y() + pad)))
-        p.setPen(QPen(TEXT))
-        p.setFont(QFont(QFont().family(), 5, QFont.Bold))
-        p.drawText(int(fx(0.04, 0.08).x()), int(fx(0.04, 0.08).y() + pad / 2), "L/R")
-
-        # Seawall along the bottom
-        p.setPen(QPen(SEA, 2, Qt.DashLine))
-        p.drawLine(QPointF(bx0, by1), QPointF(bx1, by1))
-        p.setPen(QPen(TEXT))
-        p.setFont(QFont(QFont().family(), 6, QFont.Bold))
-        p.drawText(int((bx0 + bx1) / 2 - 30), int(by1 - 4), "SEAWALL")
-
-        # Coordinated Logistics platform (right side) with 3 bays
-        plat = fx(0.80, 0.42)
-        px0, py0 = plat.x(), plat.y()
-        pw, ph = bw * 0.12, bh * 0.40
-        p.setPen(QPen(SCHEMATIC, 2))
-        p.setBrush(QBrush(QColor(0xd8, 0xc9, 0xa8)))
-        p.drawRect(QRectF(px0, py0, pw, ph))
-        p.setPen(QPen(QColor(0xf4, 0xf6, 0xf8), 1))
-        p.setBrush(QBrush(QColor(0xf4, 0xf6, 0xf8)))
-        for i in range(3):
-            by = py0 + ph * (0.15 + i * 0.30)
-            p.drawRect(QRectF(px0 + pw * 0.55, by, pw * 0.35, ph * 0.22))
-        p.setPen(QPen(TEXT))
-        p.setFont(QFont(QFont().family(), 5, QFont.Bold))
-        p.drawText(int(px0), int(py0 - 4), "coordinated logistics")
-
-        # Task labels (context only — live data drawn at real positions)
-        p.setPen(QPen(QColor(0x25, 0x3b, 0x52)))
-        p.setFont(QFont(QFont().family(), 6, QFont.Bold))
-        p.drawText(int(fx(0.34, 0.12).x()), int(fx(0.34, 0.12).y()), "safe passage")
-        p.drawText(int(fx(0.12, 0.66).x()), int(fx(0.12, 0.66).y()), "infrastructure")
-        p.drawText(int(fx(0.12, 0.72).x()), int(fx(0.12, 0.72).y()), "survey & repair")
+        p.setBrush(QBrush(theme.qcolor(theme.TEXT_MUTED)))
+        p.drawPolygon(QPolygonF([QPointF(nx, ny - 10), QPointF(nx - 5, ny + 4), QPointF(nx + 5, ny + 4)]))
+        p.setPen(theme.qcolor(theme.TEXT_MUTED))
+        p.setFont(theme.ui_font(8, 700))
+        p.drawText(QRectF(nx - 10, ny + 5, 20, 14), Qt.AlignCenter, "N")
 
     def _draw_legend(self, p):
-        x = self.width() - 150
-        y = self.height() - 96
-        p.setPen(QPen(QColor(0x11, 0x11, 0x1b, 180), 1))
-        p.setBrush(QBrush(QColor(0x1e, 0x1e, 0x2e, 200)))
-        p.drawRect(QRectF(x, y, 140, 88))
-        p.setPen(QPen(QColor(0xcc, 0xd6, 0xf4)))
-        p.setFont(QFont(QFont().family(), 6, QFont.Bold))
-        p.drawText(int(x + 8), int(y + 12), "Beacon states")
-        p.setFont(QFont(QFont().family(), 6))
-        entries = [
-            (QColor(0xe5, 0x39, 0x35), "flashing red — starboard"),
-            (QColor(0x4c, 0xaf, 0x50), "flashing green — port"),
-            (QColor(0x1e, 0x88, 0xe5), "blue — entry / exit"),
-            (QColor(0x9e, 0x9e, 0x9e), "off — not on route"),
-        ]
-        for i, (col, txt) in enumerate(entries):
-            yy = y + 24 + i * 14
+        types = sorted({vehicle_type_name(hb.vehicle_type) for hb, _, _ in self._vehicles.values()})
+        items = [(theme.type_color(t), t) for t in types]
+        if self._geofence_points:
+            items.append((theme.MAP_GEOFENCE, "UAV geofence"))
+        if not items:
+            return
+        p.setFont(theme.ui_font(8))
+        fm = QFontMetrics(theme.ui_font(8))
+        w = max(fm.horizontalAdvance(t) for _, t in items) + 34
+        h = 10 + 16 * len(items)
+        r = QRectF(self.width() - w - 12, self.height() - h - 12, w, h)
+        p.setPen(QPen(theme.qcolor(theme.BORDER), 1))
+        p.setBrush(QBrush(theme.qcolor(theme.SURFACE, 220)))
+        p.drawRoundedRect(r, 6, 6)
+        for i, (color, text) in enumerate(items):
+            cy = r.top() + 13 + i * 16
             p.setPen(Qt.NoPen)
-            p.setBrush(QBrush(col))
-            p.drawEllipse(QPointF(x + 14, yy - 3), 4, 4)
-            p.setPen(QPen(QColor(0xcc, 0xd6, 0xf4)))
-            p.drawText(int(x + 24), int(yy), txt)
+            p.setBrush(QBrush(theme.qcolor(color)))
+            p.drawRoundedRect(QRectF(r.left() + 10, cy - 4, 10, 8), 2, 2)
+            p.setPen(theme.qcolor(theme.TEXT_MUTED))
+            p.drawText(QPointF(r.left() + 26, cy + 4), text)

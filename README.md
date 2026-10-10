@@ -45,13 +45,16 @@ cannot interfere with a run. It shows:
 
 | Panel | Shows |
 |---|---|
-| **Course Map** | Course boundary and schematic, every reporting vehicle labelled `TEAM/VEHICLE` with heading and movement trail, the declared UAV geofence, and the latest Safe Passage / Pipeline reports |
+| **Course Map** | Course boundary on a metre grid with scale bar, every reporting vehicle labelled `TEAM/VEHICLE` with heading and movement trail, the declared UAV geofence, and the latest Safe Passage / Pipeline reports |
 | **Course Configuration** | Retained `RxCourse` and its §3.4.9 validity |
 | **Teams on this course** | Per team: run state (IDLE → DECLARED → ACTIVE, or DECL MISMATCH when `RunStart.declaration_seq` does not match the declaration), live/declared vehicles, tiers, run_id, request/command seq |
 | **Vehicle Telemetry** | Per vehicle: ACTIVE / STALE / OFFLINE, heartbeat rate vs the required 2 Hz, state, current task, position, speed/heading, attitude, flight phase, report seq health (missed / out of order / restarts), task report counts |
 | **Message Log** | Requests, commands, task reports, task attempt start/end, and every rejected or malformed message |
 
-The **Show** filter in the status strip narrows the map and cards to one team.
+The team filter in the header narrows the map and cards to one team. On the map,
+scroll to zoom, drag to pan, and double-click (or **Fit**) to re-fit the course;
+**Trails** toggles the movement history. A vehicle whose heartbeats stop is drawn
+dimmed with a dashed amber ring and a STALE label.
 
 Checks applied to incoming traffic:
 
