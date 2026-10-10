@@ -258,7 +258,14 @@ class MainWindow(QMainWindow):
             if link == "LOST":
                 self.log_panel.append_log(
                     f"[WARN] {tid} GCS link lost: no heartbeat for {format_age(age)}")
-            elif link == "UP" and previous == "LOST":
+            elif link == "NO HEARTBEAT" and age > STALE_SECONDS:
+                self.log_panel.append_log(
+                    f"[WARN] {tid} GCS sent no heartbeats ({format_age(age)} since its last "
+                    f"message); is the vehicle side publishing?")
+            elif link == "NO HEARTBEAT":
+                self._team_links.pop(tid, None)     # re-check once the grace period passes
+                continue
+            elif link == "UP" and previous in ("LOST", "NO HEARTBEAT"):
                 self.log_panel.append_log(f"{tid} GCS link restored")
 
     def _refresh_header(self, team, now):
@@ -271,6 +278,8 @@ class MainWindow(QMainWindow):
             link, age = self.fleet.team_link(t.team_id, now)
             if link == "LOST":
                 set_chip(self.run_chip, f"{t.team_id} {run} · LINK LOST {format_age(age)}", theme.FAULT)
+            elif link == "NO HEARTBEAT" and age > STALE_SECONDS:
+                set_chip(self.run_chip, f"{t.team_id} {run} · NO HEARTBEAT {format_age(age)}", theme.FAULT)
             else:
                 set_chip(self.run_chip, f"{t.team_id} {run}", RUN_COLORS.get(t.run_state, theme.IDLE))
         else:

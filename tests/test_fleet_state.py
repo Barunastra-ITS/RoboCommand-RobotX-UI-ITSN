@@ -145,6 +145,17 @@ class TestTeamLink(unittest.TestCase):
         self.assertAlmostEqual(age, 60.0)
 
 
+class TestTeamLinkWithoutHeartbeats(unittest.TestCase):
+    def test_declared_but_silent_gcs(self):
+        fleet = FleetState()
+        fleet.ingest_request(TEAM, declaration(1, ("USV1", "UAV1")), now=100.0)
+        state, age = fleet.team_link(TEAM, now=580.0)
+        self.assertEqual(state, "NO HEARTBEAT")
+        self.assertAlmostEqual(age, 480.0)
+        fleet.ingest_report(TEAM, "USV1", heartbeat(1), now=600.0)
+        self.assertEqual(fleet.team_link(TEAM, now=600.5)[0], "UP")
+
+
 class TestRunState(unittest.TestCase):
     def test_declared_then_active(self):
         fleet = FleetState()

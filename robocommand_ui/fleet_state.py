@@ -70,6 +70,7 @@ class TeamState:
         self.geofence: List[LatLng] = []
         self.last_request_seq = 0
         self.last_command_seq = 0
+        self.last_seen: Optional[float] = None    # last message from the team's GCS
         self.run_id: Optional[int] = None
         self.run_start_declaration_seq: Optional[int] = None
         # Latest Task 1 / Task 2 report contents for the map
@@ -136,16 +137,21 @@ class FleetState:
         return sorted(self.teams)
 
     def team_link(self, team_id: str, now: Optional[float] = None) -> Tuple[str, Optional[float]]:
-        """State of a team's GCS link, judged from its heartbeats.
+        """State of a team's GCS link, judged from what it sends.
 
         MQTT clients can't see each other's connections, so the host can only
-        tell a GCS is gone when its heartbeats stop. Returns (state, age_s):
-        "UP" when any vehicle heartbeat is fresh, "LOST" when the newest is
-        older than STALE_SECONDS, "NO DATA" before any heartbeat.
+        tell a GCS is gone when its messages stop. Returns (state, age_s):
+        "UP" when any vehicle heartbeat is fresh, "LOST" when heartbeats came
+        and then stopped, "NO HEARTBEAT" when the GCS sent something (e.g. a
+        RunDeclaration) but never a heartbeat (age = since its last message),
+        "NO DATA" when nothing has come from the team's GCS at all.
         """
         now = time.time() if now is None else now
         ages = [v.age(now) for v in self.vehicles_of(team_id) if v.last_hb is not None]
         if not ages:
+            team = self.teams.get(team_id)
+            if team is not None and team.last_seen is not None:
+                return "NO HEARTBEAT", now - team.last_seen
             return "NO DATA", None
         newest = min(ages)
         return ("UP" if newest <= STALE_SECONDS else "LOST"), newest
@@ -165,6 +171,7 @@ class FleetState:
             return [f"[REJECT] report topic {topic_team}/{topic_vehicle} does not match "
                     f"message {report.team_id}/{report.vehicle_id}"]
 
+        self.team(topic_team).last_seen = now
         v = self.vehicle(topic_team, topic_vehicle)
         accepted, seq_notices = self._check_seq(v, report.seq)
         notices.extend(seq_notices)
@@ -185,6 +192,7 @@ class FleetState:
         if request.team_id != topic_team:
             return [f"[REJECT] request topic team {topic_team} does not match message {request.team_id}"]
         team = self.team(topic_team)
+        team.last_seen = time.time() if now is None else now
         notices = []
         if request.seq <= team.last_request_seq:
             notices.append(f"[WARN] {topic_team} request seq {request.seq} not increasing "

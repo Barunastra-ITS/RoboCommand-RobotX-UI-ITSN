@@ -42,7 +42,7 @@ class TeamsPanel(Panel):
         self.table.setHorizontalHeaderLabels(COLUMNS)
         header = self.table.horizontalHeader()
         header.setSectionResizeMode(QHeaderView.Stretch)
-        for col in (0, 1):                  # team + run state keep their full text
+        for col in (0, 1, 2):               # team, run state and link keep their full text
             header.setSectionResizeMode(col, QHeaderView.ResizeToContents)
         header.setDefaultAlignment(Qt.AlignLeft | Qt.AlignVCenter)
         self.table.verticalHeader().setVisible(False)
@@ -82,6 +82,10 @@ class TeamsPanel(Panel):
             live_text = f"{live}/{declared}" if declared else f"{live}/-"
             if link == "LOST":
                 live_text = f"LOST {format_age(link_age)}"
+            elif link == "NO HEARTBEAT" and link_age > STALE_SECONDS:
+                live_text = f"NO HB {format_age(link_age)}"
+            else:
+                link = "UP" if link == "UP" else "WAIT"
             values = [
                 tid,
                 team.run_state,
@@ -98,7 +102,7 @@ class TeamsPanel(Panel):
                 item.setFont(theme.ui_font(10, 700) if col in (0, 1) else theme.mono_font(9.5))
                 if col == 1:
                     item.setForeground(theme.qcolor(RUN_COLORS.get(text, theme.TEXT)))
-                elif col == 2 and link == "LOST":
+                elif col == 2 and link in ("LOST", "NO HEARTBEAT"):
                     item.setForeground(theme.qcolor(theme.FAULT))
                 elif col == 2 and declared and live < declared:
                     item.setForeground(theme.qcolor(theme.WARN))

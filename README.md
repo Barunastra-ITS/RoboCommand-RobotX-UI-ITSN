@@ -20,6 +20,9 @@ Two programs for the RobotX 2026 communications protocol (Team Handbook §3.4):
 | Delta | 192.168.68.0/24 | 192.168.68.2 |
 | Team Village demo | VLAN 70 | from the demo instructions (`--host`) |
 
+**Running the host (192.168.65.2)?** See [HOST_GUIDE.md](HOST_GUIDE.md): broker, `run_ui.py`,
+`PYTHONPATH`, and every `test_client.py` parameter for publishing the course and RunStart.
+
 ## Requirements
 
 - Python 3.9+, PyQt5 5.15+, paho-mqtt 2.x
