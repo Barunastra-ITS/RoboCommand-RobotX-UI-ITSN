@@ -9,12 +9,9 @@ dist/
 venv/
 env/
 
-# Note: robocommand/RobotX_2026/gen/python/**/__pycache__/*.pyc are tracked
-# upstream. Those regenerate whenever the UI imports the vendored protos, so
-# running the app dirties the submodule. Restore them after a run:
-#   git -C robocommand checkout -- \
-#     'RobotX_2026/gen/python/__pycache__' \
-#     'RobotX_2026/gen/python/robotx/__pycache__'
+# The vendored robocommand submodule tracks some __pycache__/*.pyc upstream,
+# which .gitignore cannot ignore. .gitmodules sets `ignore = dirty` so the
+# regenerated .pyc files never show the submodule as modified here.
 
 # RoboCommand test-server session logs (docker compose bind-mounts ./logs)
 robocommand/RobotX_2026/logs/

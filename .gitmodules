@@ -1,3 +1,4 @@
 [submodule "robocommand"]
 	path = robocommand
 	url = git@github.com:robonation/robocommand.git
+	ignore = dirty
