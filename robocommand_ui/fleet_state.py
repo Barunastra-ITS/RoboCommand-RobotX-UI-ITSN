@@ -73,12 +73,17 @@ class TeamState:
         self.last_seen: Optional[float] = None    # last message from the team's GCS
         self.run_id: Optional[int] = None
         self.run_start_declaration_seq: Optional[int] = None
+        # Set when the host ended the run; cleared by the team's next declaration
+        self.ended = False
+        self.last_run_id: Optional[int] = None
         # Latest Task 1 / Task 2 report contents for the map
         self.safe_passage: Optional[Tuple[LatLng, LatLng, List[Tuple[float, float, int]]]] = None
         self.pipeline: Optional[Tuple[LatLng, List[int]]] = None
 
     @property
     def run_state(self) -> str:
+        if self.ended and self.run_id is None:
+            return "ENDED"
         if self.run_id is not None:
             # Requests are not retained: a host that connected after the team
             # declared never saw the declaration, so it can't call a mismatch.
@@ -207,6 +212,7 @@ class FleetState:
             team.geofence = [(p.latitude, p.longitude) for p in decl.uav_geofence]
             team.run_id = None
             team.run_start_declaration_seq = None
+            team.ended = False
             for vid in team.declared_vehicles:
                 self.vehicle(topic_team, vid)
             notices.append(f"{topic_team} declared run seq={request.seq} "
@@ -220,6 +226,7 @@ class FleetState:
         team.last_command_seq = max(team.last_command_seq, command.seq)
         if command.WhichOneof("body") == "run_start":
             rs = command.run_start
+            team.ended = False
             team.run_id = rs.run_id
             team.run_start_declaration_seq = rs.declaration_seq
             if team.declaration_seq is None:
@@ -230,6 +237,28 @@ class FleetState:
                         f"does not match declaration seq={team.declaration_seq}"]
             return [f"{topic_team} RunStart run_id={rs.run_id}"]
         return []
+
+    def reset_counters(self, team_id: str) -> None:
+        """Forget the team's command seq and last run id (host restarts numbering)."""
+        team = self.teams.get(team_id)
+        if team is not None:
+            team.last_command_seq = 0
+            team.last_run_id = None
+
+    def end_run(self, team_id: str) -> Optional[int]:
+        """The host ends a team's run (there is no protocol message for it).
+
+        The team shows ENDED until it sends a new RunDeclaration. Returns the
+        run_id that ended, or None when the team had no run in progress.
+        """
+        team = self.teams.get(team_id)
+        if team is None or team.run_id is None:
+            return None
+        team.last_run_id = team.run_id
+        team.run_id = None
+        team.run_start_declaration_seq = None
+        team.ended = True
+        return team.last_run_id
 
     # ---------------- internals ----------------
 

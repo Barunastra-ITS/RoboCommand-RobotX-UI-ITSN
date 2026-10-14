@@ -3,6 +3,9 @@
 Replaces ``rc assistance-request`` / ``readiness-confirm`` (Core),
 ``keep-out-zone`` / ``all-clear`` (Advanced) and ``moving-object-alert``
 (Disruptive). Every command goes to the selected team with the next seq.
+Only the panel of the team's declared Task 4 tier can send: each tier has its
+own command chain (§3.4.12), so a team that declared Advanced gets keep-out
+zones and all-clears, not assistance requests or moving objects.
 The history below matches each command with the team's IncidentAck and
 ReadinessReport, and fills in the Readiness confirm for you.
 """
@@ -45,6 +48,7 @@ class Task4Tab(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._connected = False
+        self._declared_tier = None      # team's Task 4 tier, None when not declared / not seen
         self._filled_readiness = None
         self._send_buttons = []
 
@@ -234,8 +238,10 @@ class Task4Tab(QWidget):
             set_chip(self.run_chip, "NO TEAM", theme.IDLE)
             set_chip(self.tier_chip, "TASK 4 —", theme.IDLE)
             self.live_label.setText("No team on the broker yet.")
+            self._declared_tier = None
             for panel in self._tier_panels:
                 panel.set_meta("")
+            self._sync_buttons()
             return
         state = team.run_state
         set_chip(self.run_chip, state, theme.OK if state == "ACTIVE" else theme.WARN)
@@ -248,9 +254,11 @@ class Task4Tab(QWidget):
                 for v in fleet.vehicles_of(team.team_id)
                 if v.age(now) is not None and v.age(now) <= STALE_SECONDS]
         self.live_label.setText("Live: " + (", ".join(live) if live else "none"))
+        self._declared_tier = declared
         for panel, level in zip(self._tier_panels, TIER_LEVELS):
-            ok = declared is not None and declared >= level
-            panel.set_meta("declared" if ok else "not declared")
+            panel.set_meta("declared" if declared == level else
+                           f"not declared (Task 4 is {tier})")
+        self._sync_buttons()
         vehicles = team.declared_vehicles or [v.vehicle_id for v in fleet.vehicles_of(team.team_id)]
         known = [self.confirm_vehicle.itemText(i) for i in range(self.confirm_vehicle.count())]
         if known != vehicles:
@@ -290,12 +298,18 @@ class Task4Tab(QWidget):
                 self.history.setItem(row, col, item)
 
     def _sync_buttons(self) -> None:
+        """Send buttons work only when connected, and only in the declared tier's panel."""
         enabled = self._connected and bool(self.selected_team())
         tip = "" if enabled else ("Connect to the broker first" if not self._connected
                                   else "No team selected")
         for btn in self._send_buttons:
             btn.setEnabled(enabled)
             btn.setStatusTip(tip)
+        for panel, level in zip(self._tier_panels, TIER_LEVELS):
+            allowed = self._declared_tier == level
+            panel.setEnabled(allowed)
+            panel.setToolTip("" if allowed else
+                             "Not this team's declared Task 4 tier (or its declaration was not seen)")
 
     # ---------- senders ----------
     def _emit(self, body, summary: str) -> None:

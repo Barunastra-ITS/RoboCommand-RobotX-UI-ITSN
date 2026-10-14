@@ -118,6 +118,10 @@ class CommandSender:
     def next_seq(self, team_id: str) -> int:
         return max(self._sent.get(team_id, 0), self._seen_seq(team_id)) + 1
 
+    def reset(self, team_id: str) -> None:
+        """Restart a team's RxCommand.seq at 1 (only between runs: see RunStartTab)."""
+        self._sent.pop(team_id, None)
+
     def send_course(self, course) -> SendResult:
         err = self._publish(COURSE_TOPIC, course.SerializeToString(), True)
         return SendResult(err is None, 0, err or "")

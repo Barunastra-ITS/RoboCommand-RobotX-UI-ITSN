@@ -218,10 +218,12 @@ def stylesheet() -> str:
     QPushButton#Primary:disabled {{ color: {TEXT_FAINT}; background: {SURFACE_2}; border-color: {BORDER_SOFT}; }}
     QPushButton#Danger {{ background: transparent; color: {FAULT}; border: 1px solid {FAULT}; }}
     QPushButton#Danger:hover {{ background: {fault_fill}; color: {SOLID[FAULT][1]}; }}
+    QPushButton#Danger:disabled {{ color: {TEXT_FAINT}; border-color: {BORDER_SOFT}; background: transparent; }}
     QPushButton#Ghost {{ background: {SURFACE_2}; color: {TEXT_MUTED}; border: 1px solid {BORDER};
                          padding: 4px 12px; font-size: 11px; }}
     QPushButton#Ghost:hover {{ color: {TEXT}; background: {SURFACE_3}; border-color: {ACCENT}; }}
     QPushButton#Ghost:checked {{ color: {TEXT_STRONG}; border-color: {ACCENT}; }}
+    QPushButton#Ghost:disabled {{ color: {TEXT_FAINT}; border-color: {BORDER_SOFT}; background: transparent; }}
 
     /* tables */
     QTableWidget {{ background: {WELL}; border: 1px solid {BORDER_SOFT}; border-radius: {RADIUS}px;

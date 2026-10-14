@@ -25,13 +25,14 @@ from robocommand_ui.fleet_state import STALE_SECONDS
 from robocommand_ui.proto_helper import rx_common_pb2, vehicle_type_name
 from robocommand_ui.widgets.panel import Panel
 from robocommand_ui.widgets.tiles import (
-    ATTRIBUTION, MAX_ZOOM, shared_loader, unit_to_latlng, unit_xy,
+    ATTRIBUTION, MAX_ZOOM, TILE_SIZE, shared_loader, unit_to_latlng, unit_xy,
 )
 
 LatLng = Tuple[float, float]
 M_PER_DEG_LAT = 111_320.0
 GRID_STEPS_M = (1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000)
 MIN_GRID_PX = 64
+WORLD_HEIGHT_FILL = 1.35          # world view: Mercator square taller than the map, poles cropped
 EARTH_M_PER_PX_Z0 = 156_543.033928
 FIT_MARGIN = 0.12
 
@@ -274,6 +275,8 @@ class MapCanvas(QWidget):
         p.fillRect(self.rect(), theme.qcolor(theme.MAP_WATER))
 
         if not self._ensure_origin():
+            if self._show_tiles:
+                self._draw_world(p)         # global satellite view, as on the OCS
             self._draw_empty(p)
             return
         if not self._user_view:
@@ -324,15 +327,55 @@ class MapCanvas(QWidget):
                        ATTRIBUTION)
         return drew
 
+    def _draw_world(self, p) -> bool:
+        """Whole-world imagery, repeated east-west, until there is a course or a boat."""
+        w, h = self.width(), self.height()
+        world = h * WORLD_HEIGHT_FILL
+        z = int(max(1, min(MAX_ZOOM, round(math.log2(world / TILE_SIZE)))))
+        n = 1 << z
+        size = world / n
+        left, top = w / 2 - world / 2, h / 2 - world / 2
+        drew = False
+        p.setRenderHint(QPainter.SmoothPixmapTransform)
+        for tx in range(math.floor(-left / size), math.floor((w - left) / size) + 1):
+            for ty in range(max(0, math.floor(-top / size)), min(n - 1, math.floor((h - top) / size)) + 1):
+                pix = self._tiles.tile(z, tx, ty)
+                if pix is not None:
+                    p.drawPixmap(QRectF(left + tx * size, top + ty * size, size + 0.5, size + 0.5),
+                                 pix, QRectF(pix.rect()))
+                    drew = True
+        if drew:
+            p.setPen(theme.qcolor(theme.TEXT_MUTED))
+            p.setFont(theme.ui_font(7.5))
+            p.drawText(QRectF(0, h - 16, w - 10, 14), Qt.AlignRight | Qt.AlignVCenter, ATTRIBUTION)
+        return drew
+
     def _draw_empty(self, p):
-        p.setPen(theme.qcolor(theme.TEXT_MUTED))
-        p.setFont(theme.ui_font(12, 600))
+        """Centred card over the world view (or the plain well when offline)."""
         r = QRectF(self.rect())
-        p.drawText(r.adjusted(0, -14, 0, -14), Qt.AlignCenter, "Waiting for RxCourse")
-        p.setPen(theme.qcolor(theme.TEXT_FAINT))
-        p.setFont(theme.ui_font(9))
-        p.drawText(r.adjusted(0, 16, 0, 16), Qt.AlignCenter,
-                   "The course boundary appears when RoboCommand publishes it")
+        card = QRectF(0, 0, min(420.0, r.width() - 40), 168)
+        card.moveCenter(r.center())
+        p.setPen(QPen(theme.qcolor(theme.BORDER), 1))
+        p.setBrush(QBrush(theme.qcolor(theme.SURFACE, 215)))
+        p.drawRoundedRect(card, theme.RADIUS_LG, theme.RADIUS_LG)
+        # radar glyph
+        c = QPointF(card.center().x(), card.top() + 52)
+        p.setBrush(Qt.NoBrush)
+        p.setPen(QPen(theme.qcolor(theme.TEXT_MUTED), 1.4))
+        for radius in (8, 16, 24):
+            p.drawEllipse(c, radius, radius)
+        p.drawLine(c, c + QPointF(17, -17))
+        p.setPen(Qt.NoPen)
+        p.setBrush(QBrush(theme.qcolor(theme.TEXT_MUTED)))
+        p.drawEllipse(c, 2.5, 2.5)
+        p.setPen(theme.qcolor(theme.TEXT))
+        p.setFont(theme.ui_font(12, 700))
+        p.drawText(QRectF(card.left(), card.top() + 88, card.width(), 26), Qt.AlignCenter,
+                   "WAITING FOR RXCOURSE")
+        p.setPen(theme.qcolor(theme.TEXT_MUTED))
+        p.setFont(theme.ui_font(9.5))
+        p.drawText(QRectF(card.left(), card.top() + 116, card.width(), 22), Qt.AlignCenter,
+                   "course boundary / vehicle heartbeats")
 
     def _grid_step(self) -> float:
         for step in GRID_STEPS_M:

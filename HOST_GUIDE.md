@@ -70,6 +70,8 @@ listening. It calls `python3`, so prefer `python3.10 run_ui.py` on this laptop.
 |---|---|---|
 | **Course** | Pick a preset (built-in: `Danau 8`, `Promontory SG`) or type Course ID, pinger, corners → **Publish course (retained)**. **Save as preset…** stores your own in `~/.config/robocommand_ui/course_presets.json`. The ring is closed for you | `rc course …` |
 | **Run start** | When the GCS declares, the team appears as **DECLARED** (preselected) → set Run ID → **Allow start** | `rc run-start --team ITSN --declaration-seq <seq> --run-id <n>` |
+| **Run start → End run** | Run over (time up, judge's call) → select the ACTIVE team → **End run** → confirm. Nothing is sent (the handbook has no run-end message); the run log is saved to `~/.local/share/robocommand_ui/runs/<date>_<team>_run<id>.log` and the team shows **ENDED**. Ask the GCS for the next run (`ros2 service call /nala2_report/new_run std_srvs/srv/Trigger`); its new declaration shows as DECLARED with the next Run ID suggested | — |
+| **Run start → Reset run ID & seq** | Bottom of the panel, enabled only between runs (DECLARED or ENDED). Next Run ID back to 1 and this team's command seq back to 1 — e.g. at the start of a new day. Do it after the team's new declaration (or `new_run`): until then the GCS drops a repeated seq as a duplicate | — |
 | **Task 4 → Core** | Vehicle type + point → **Send assistance request**. When the ReadinessReport arrives, *Vehicle ID* and *Report seq R* fill themselves in → **Send readiness confirm** | `assistance-request`, `readiness-confirm` |
 | **Task 4 → Advanced** | Type + centre + radius → **Send keep-out zone**; later **Send all clear** | `keep-out-zone`, `all-clear` |
 | **Task 4 → Disruptive** | Point + heading + speed + affected types → **Send moving object alert**; send again to move it | `moving-object-alert` |
@@ -237,7 +239,7 @@ GCS answers with reports. Section 3.5 lists the options; this section is the ord
 | Check | Where |
 |---|---|
 | Team is `ACTIVE · RUN n` | Header chip / teams panel. Don't send Task 4 to a team that is only DECLARED |
-| Declared Task 4 tier | Tier column in the teams panel. Give only what was declared: Core → assistance request; Advanced → + keep-out / all-clear; Disruptive → + moving object |
+| Declared Task 4 tier | Tier column in the teams panel. Each tier has its **own** chain — Core: assistance request + readiness confirm; Advanced: keep-out zone + all clear; Disruptive: moving object alert. The Task 4 tab enables only the declared tier's panel |
 | Vehicle of the targeted type is LIVE | Vehicle cards. Commands are addressed by **vehicle type**, not ID |
 | Positions are inside the course | Pick `--lat/--lng` inside the course boundary on the map (the 3.5 defaults are in Singapore) |
 
@@ -399,9 +401,12 @@ ros2 run nala2_report report_inject    # synthetic vehicle heartbeats if no boat
 #   Run start tab: ITSN shows DECLARED → Allow start
 #   Task 4 tab:    send the tier's commands, watch "Sent commands" for the answers
 
+#   Run over:      Run start tab → End run (saves the run log; team shows ENDED)
+
 # next run on the SAME course: the GCS keeps its declaration across reconnects and
 # restarts, so ask it for a fresh one (a different course re-declares by itself)
 ros2 service call /nala2_report/new_run std_srvs/srv/Trigger
+#   Run start tab: the team is DECLARED again → Allow start (Run ID suggested +1)
 ```
 
 ## 6. Troubleshooting
@@ -420,4 +425,6 @@ ros2 service call /nala2_report/new_run std_srvs/srv/Trigger
 | Team never `DECLARED` | GCS log `RunDeclaration NOT sent: …` — a UAV declared without a geofence, a geofence point outside the course, or a bad `vehicle_ids`. Fix the GCS parameter |
 | `ACTIVE` but the boat does not move | Check the GCS log for `RunStart verified` — or `NOT forwarded` (declaration mismatch) |
 | Same team re-declares between runs | Expected after `new_run` or a different course; Run start lists the new declaration seq |
+| Team stuck `ENDED` | You ended the run; the GCS has not declared again. GCS: `ros2 service call /nala2_report/new_run std_srvs/srv/Trigger` |
+| Where is the run log? | `~/.local/share/robocommand_ui/runs/` — one file per run (also written when a team re-declares mid-run or the console closes during a run) |
 | GCS can't reach the host | `systemctl is-active mosquitto`; the GCS needs a `192.168.65.x` address (no DHCP server on this laptop — bench: give the GCS a static `192.168.65.x/24`) |

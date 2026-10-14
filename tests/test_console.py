@@ -15,6 +15,7 @@ from robocommand_ui.course_presets import (
 )
 from robocommand_ui.course_validation import validate_course
 from robocommand_ui.incident_log import IncidentLog
+from robocommand_ui.run_log import RunRecorder
 from robocommand_ui.proto_helper import rx_commands_pb2, rx_common_pb2, rx_reports_pb2
 
 TEAM = "ITSN"
@@ -84,6 +85,16 @@ class TestCommandSender(unittest.TestCase):
         self.assertFalse(result.ok)
         self.assertIn("not connected", result.error)
         self.assertEqual(sender.next_seq(TEAM), 1)
+
+    def test_reset_restarts_one_teams_seq(self):
+        broker = FakeBroker()
+        seen = {TEAM: 0}
+        sender = commands.CommandSender(broker.publish, lambda t: seen[t] if t in seen else 0)
+        sender.send_command(TEAM, commands.all_clear("USV"))
+        sender.send_command("RNRX", commands.all_clear("USV"))
+        sender.reset(TEAM)
+        self.assertEqual(sender.next_seq(TEAM), 1)
+        self.assertEqual(sender.next_seq("RNRX"), 2)
 
     def test_no_team_is_refused(self):
         sender = commands.CommandSender(FakeBroker().publish, lambda t: 0)
@@ -200,6 +211,54 @@ class TestIncidentLog(unittest.TestCase):
         log.record("RNRX", 1, "all_clear", "", now=300.0)
         self.assertEqual([e.seq for e in log.entries(TEAM)], [2, 1])
         self.assertEqual(len(log.entries()), 3)
+
+
+class TestRunRecorder(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self.tmp.name) / "runs"
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_log_covers_only_the_run_and_is_written_on_finish(self):
+        rec = RunRecorder(self.dir)
+        rec.note("before the run")
+        rec.begin(TEAM, run_id=7, declaration_seq=3, now=1000.0)
+        self.assertTrue(rec.is_active(TEAM))
+        rec.note("[RxReport] ITSN/USV1 seq=5 incident_ack")
+        path = rec.finish(TEAM, "ended by host", ["Summary line"], now=1065.0)
+        self.assertFalse(rec.is_active(TEAM))
+        text = path.read_text()
+        self.assertIn(f"_{TEAM}_run7.log", path.name)
+        self.assertIn("run_id 7", text)
+        self.assertIn("declaration seq 3", text)
+        self.assertIn("1m05s", text)
+        self.assertIn("ended by host", text)
+        self.assertIn("Summary line", text)
+        self.assertIn("incident_ack", text)
+        self.assertNotIn("before the run", text)
+
+    def test_finish_without_a_run_writes_nothing(self):
+        rec = RunRecorder(self.dir)
+        self.assertIsNone(rec.finish(TEAM, "x", [], now=1.0))
+        self.assertFalse(self.dir.exists())
+
+    def test_runs_of_two_teams_are_separate(self):
+        rec = RunRecorder(self.dir)
+        rec.begin(TEAM, 1, 1, now=10.0)
+        rec.begin("RNRX", 2, 1, now=10.0)
+        rec.note("shared line")
+        a = rec.finish(TEAM, "done", [], now=20.0)
+        self.assertTrue(rec.is_active("RNRX"))
+        self.assertIn("shared line", a.read_text())
+
+    def test_incident_log_can_forget_one_team(self):
+        log = IncidentLog()
+        log.record(TEAM, 1, "all_clear", "")
+        log.record("RNRX", 1, "all_clear", "")
+        log.clear_team(TEAM)
+        self.assertEqual([e.team_id for e in log.entries()], ["RNRX"])
 
 
 if __name__ == "__main__":

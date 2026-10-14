@@ -50,7 +50,7 @@ press a send button**. It has four tabs:
 |---|---|---|
 | **Map** | Monitor: the panels below | — |
 | **Course** | Edit and publish the retained `RxCourse`. Built-in and saved presets (`~/.config/robocommand_ui/course_presets.json`), live validity, ring closed automatically, clear the retained course. **Boundary map:** type a centre lat/lng → **Go**, then click the satellite map to pin corners (click an edge to insert, drag to move, right-click to delete); the coordinate table fills itself, and edits to the table move the pins | `rc course …` |
-| **Run start** | Every team that sent a RunDeclaration; select one and press **Allow start** (declaration seq filled in from the declaration) | `rc run-start …` |
+| **Run start** | Every team that sent a RunDeclaration; select one and press **Allow start** (declaration seq filled in from the declaration). **End run** closes an ACTIVE run on this host — the protocol has no run-end message, so nothing is sent: the run log is saved to `~/.local/share/robocommand_ui/runs/` (`$ROBOCOMMAND_RUN_LOG_DIR`) and the team shows **ENDED** until its next RunDeclaration, which appears as DECLARED. A team that declares again while ACTIVE closes its previous run log automatically | `rc run-start …` |
 | **Task 4** | Core (assistance request, readiness confirm), Advanced (keep-out zone, all clear), Disruptive (moving object alert). Shows the team's declared tier and a history that matches each command with its IncidentAck / ReadinessReport; the readiness confirm fills itself in | `rc assistance-request …` etc. |
 
 Both maps use the same satellite imagery as the nala2-report OCS (Esri World Imagery), cached in

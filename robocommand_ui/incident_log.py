@@ -80,6 +80,10 @@ class IncidentLog:
                 return entry
         return None
 
+    def clear_team(self, team_id: str) -> None:
+        """Forget a team's commands (its run ended; the next run starts clean)."""
+        self._entries = {k: e for k, e in self._entries.items() if e.team_id != team_id}
+
     def mark_confirmed(self, team_id: str, vehicle_id: str, report_seq: int) -> None:
         for entry in self.entries(team_id):
             if entry.readiness == (vehicle_id, report_seq):

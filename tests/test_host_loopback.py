@@ -54,7 +54,9 @@ class TestHostLoopback(unittest.TestCase):
 
         # Host console listens to everything and publishes through the same broker
         cls.presets_dir = tempfile.TemporaryDirectory()
-        cls.win = MainWindow(presets_path=Path(cls.presets_dir.name) / "presets.json")
+        cls.run_dir = Path(cls.presets_dir.name) / "runs"
+        cls.win = MainWindow(presets_path=Path(cls.presets_dir.name) / "presets.json",
+                             run_log_dir=cls.run_dir)
         cls.broker.subscribe(f"{TOPIC_ROOT}/#", lambda m: cls.win.mqtt._on_message(None, None, m))
         cls.host_published = []
 
@@ -69,7 +71,7 @@ class TestHostLoopback(unittest.TestCase):
         cls.reporter = GcsReporter(
             "192.168.65.2", TEAM,
             {"USV1": rx_common_pb2.TYPE_USV, "UAV1": rx_common_pb2.TYPE_UAV},
-            (common_pb2.TIER_CORE, common_pb2.TIER_NONE, common_pb2.TIER_NONE, common_pb2.TIER_NONE),
+            (common_pb2.TIER_CORE, common_pb2.TIER_NONE, common_pb2.TIER_NONE, common_pb2.TIER_CORE),
             CORNERS, client_factory=cls.broker.client)
         cls.reporter.start()
 
@@ -210,7 +212,15 @@ class TestHostLoopback(unittest.TestCase):
     def test_6b_task4_assistance_ack_readiness_confirm(self):
         tab = self.win.task4_tab
         self.assertEqual(tab.selected_team(), TEAM)
-        self.assertEqual(tab.core.meta_label.text(), "not declared")     # reporter's T4 tier is NONE
+        # Task 4 declared CORE: only the Core panel can send
+        self.assertEqual(tab.core.meta_label.text(), "declared")
+        self.assertTrue(tab.core.isEnabled())
+        self.assertFalse(tab.advanced.isEnabled())
+        self.assertFalse(tab.disruptive.isEnabled())
+        self.assertIn("CORE", tab.advanced.meta_label.text())
+        sent_before = len(self.win.incidents.entries(TEAM))
+        self._click(tab, "Send keep-out zone")                          # disabled: nothing sent
+        self.assertEqual(len(self.win.incidents.entries(TEAM)), sent_before)
         tab.assist_type.setCurrentText("USV")
         tab.assist_pos.set_value((1.2806, 103.8557))
         self._click(tab, "Send assistance request")
@@ -284,6 +294,55 @@ class TestHostLoopback(unittest.TestCase):
         self.assertEqual(self.win.vehicle_monitor.card(TEAM, "USV1").status_label.text(), "OFFLINE")
         self.assertIn("Broker", self.win.connection_bar.status_label.text())
         self.win.team_filter.setCurrentText("All teams")
+
+    def test_8b_end_run_saves_the_log_and_waits_for_a_new_declaration(self):
+        win, tab = self.win, self.win.run_start_tab
+        win._confirm = lambda title, text: True
+        win.refresh_views()
+        tab.select_team(TEAM)
+        self.assertEqual(win.fleet.teams[TEAM].run_state, "ACTIVE")
+        self.assertTrue(tab.end_btn.isEnabled())
+        tab.end_btn.click()
+        team = win.fleet.teams[TEAM]
+        self.assertEqual((team.run_state, team.last_run_id), ("ENDED", 42))
+        self.assertEqual(win.incidents.entries(TEAM), [])
+        logs = sorted(self.run_dir.glob(f"*_{TEAM}_run*.log"))
+        self.assertEqual({p.name.split("_")[-1] for p in logs}, {"run42.log", "run7.log"})
+        text = [p for p in logs if p.name.endswith("run42.log")][0].read_text()
+        self.assertIn("ended by host", text)
+        self.assertIn("assistance_request", text)          # Task 4 history in the summary
+        self.assertIn("[RxCommand] ITSN seq=", text)
+        win.refresh_views()
+        tab.select_team(TEAM)
+        self.assertFalse(tab.start_btn.isEnabled())         # no restart without a new request
+        self.assertFalse(tab.end_btn.isEnabled())
+        self.assertIn("new_run", tab.detail.text())
+
+        old_seq = team.declaration_seq
+        self.assertTrue(self.reporter.declare())            # the team's next run request
+        drain(0.3)
+        win.refresh_views()
+        tab.select_team(TEAM)
+        self.assertEqual(team.run_state, "DECLARED")
+        self.assertGreater(team.declaration_seq, old_seq)
+        self.assertTrue(tab.start_btn.isEnabled())
+        self.assertEqual(tab.run_id.value(), 43)
+
+    def test_8c_reset_run_id_and_seq_for_a_team_without_a_run(self):
+        win, tab = self.win, self.win.run_start_tab
+        win._confirm = lambda title, text: True
+        win.refresh_views()
+        tab.select_team(TEAM)
+        team = win.fleet.teams[TEAM]
+        self.assertEqual(team.run_state, "DECLARED")            # after 8b's new declaration
+        self.assertTrue(tab.reset_btn.isEnabled())
+        self.assertGreater(win.sender.next_seq(TEAM), 1)
+        tab.reset_btn.click()
+        win.refresh_views()
+        tab.select_team(TEAM)
+        self.assertEqual(win.sender.next_seq(TEAM), 1)
+        self.assertEqual(tab.run_id.value(), 1)
+        self.assertIn("[RESET]", self.log_text())
 
     def test_9_host_publishes_only_what_the_operator_sent(self):
         allowed = {f"{TOPIC_ROOT}/course", f"{TOPIC_ROOT}/{TEAM}/command"}

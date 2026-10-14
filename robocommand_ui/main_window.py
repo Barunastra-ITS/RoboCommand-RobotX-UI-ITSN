@@ -23,7 +23,9 @@ from PyQt5.QtWidgets import (
 from robocommand_ui import commands, theme
 from robocommand_ui.course_validation import validate_course
 from robocommand_ui.fleet_state import STALE_SECONDS, FleetState
+from robocommand_ui.proto_helper import task_tier_name
 from robocommand_ui.incident_log import IncidentLog
+from robocommand_ui.run_log import RunRecorder, format_duration
 from robocommand_ui.mqtt_worker import MqttWorker
 from robocommand_ui.widgets.connection_bar import ConnectionBar
 from robocommand_ui.widgets.course_map import CourseMapWidget
@@ -50,7 +52,7 @@ def course_center(ring):
 
 
 class MainWindow(QMainWindow):
-    def __init__(self, presets_path=None):
+    def __init__(self, presets_path=None, run_log_dir=None):
         super().__init__()
         self.setWindowTitle("RoboCommand Host Console — RobotX 2026")
         self.setMinimumSize(1280, 780)
@@ -65,6 +67,7 @@ class MainWindow(QMainWindow):
         self.incidents = IncidentLog()
         self.sender = commands.CommandSender(self._publish, self._seen_command_seq)
         self._presets_path = presets_path
+        self.recorder = RunRecorder(run_log_dir)
 
         root = QWidget()
         root.setObjectName("Root")
@@ -212,7 +215,7 @@ class MainWindow(QMainWindow):
         self.mqtt.connected.connect(self._on_mqtt_connected)
         self.mqtt.disconnected.connect(self._on_mqtt_disconnected)
         self.mqtt.connection_error.connect(self._on_mqtt_error)
-        self.mqtt.log_message.connect(self.log_panel.append_log)
+        self.mqtt.log_message.connect(self._log)
         self.mqtt.course_received.connect(self._on_course_received)
         self.mqtt.course_cleared.connect(self._on_course_cleared)
         self.mqtt.report_received.connect(self._on_report)
@@ -221,8 +224,10 @@ class MainWindow(QMainWindow):
 
         self.course_tab.publish_requested.connect(self._publish_course)
         self.course_tab.clear_requested.connect(self._clear_course)
-        self.course_tab.log.connect(self.log_panel.append_log)
+        self.course_tab.log.connect(self._log)
         self.run_start_tab.start_requested.connect(self._start_run)
+        self.run_start_tab.end_requested.connect(self._end_run)
+        self.run_start_tab.reset_requested.connect(self._reset_counters)
         self.task4_tab.command_requested.connect(self._send_task4)
 
     # ---------- connection ----------
@@ -269,7 +274,7 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage(f"Sent {what}")
             return True
         msg = f"Could not send {what}: {result.error}"
-        self.log_panel.append_log(f"[ERROR] {msg}")
+        self._log(f"[ERROR] {msg}")
         self.statusBar().showMessage(msg)
         QMessageBox.warning(self, "Not sent", msg)
         return False
@@ -285,12 +290,12 @@ class MainWindow(QMainWindow):
                 f"its GCS uses mid-run. Publish anyway?"):
             return
         if self._report_send(f"course {course.course_id}", self.sender.send_course(course)):
-            self.log_panel.append_log(f"[SENT] RxCourse {course.course_id} "
+            self._log(f"[SENT] RxCourse {course.course_id} "
                                       f"({len(course.corners)} corners, retained)")
 
     def _clear_course(self):
         if self._report_send("course clear", self.sender.clear_course()):
-            self.log_panel.append_log("[SENT] cleared retained RxCourse")
+            self._log("[SENT] cleared retained RxCourse")
 
     def _start_run(self, team_id: str, declaration_seq: int, run_id: int):
         team = self.fleet.teams.get(team_id)
@@ -314,7 +319,7 @@ class MainWindow(QMainWindow):
         result = self.sender.send_command(team_id, body)
         if not self._report_send(f"{name} to {team_id}", result):
             return
-        self.log_panel.append_log(f"[SENT] {team_id} seq={result.seq} {name}: {summary}")
+        self._log(f"[SENT] {team_id} seq={result.seq} {name}: {summary}")
         if name != "run_start":
             self.incidents.record(team_id, result.seq, name, summary)
         if name == "readiness_confirm":
@@ -335,42 +340,108 @@ class MainWindow(QMainWindow):
             self.course_id_label.setToolTip("; ".join(issues))
             msg = f"Course {name} INVALID: {issues[0]}"
             self.statusBar().showMessage(msg)
-            self.log_panel.append_log(f"[ERROR] {msg}")
+            self._log(f"[ERROR] {msg}")
         else:
             set_chip(self.course_id_label, f"COURSE {name}", theme.TEXT_MUTED)
             self.course_id_label.setToolTip(f"{course.pinger_freq_hz} Hz pinger, "
                                             f"{len(course.corners)} corners")
-            self.log_panel.append_log(f"[RxCourse] {name} valid")
+            self._log(f"[RxCourse] {name} valid")
 
     def _on_course_cleared(self):
         self.course_tab.show_broker_course(None)
         set_chip(self.course_id_label, "COURSE —", theme.IDLE)
-        self.log_panel.append_log("[RxCourse] retained course cleared")
+        self._log("[RxCourse] retained course cleared")
 
     def _on_report(self, team_id: str, vehicle_id: str, report):
         is_new = (team_id, vehicle_id) not in self.fleet.vehicles
         self._log_notices(self.fleet.ingest_report(team_id, vehicle_id, report))
         body = report.WhichOneof("body")
         if body and body != "heartbeat":
-            self.log_panel.append_log(f"[RxReport] {team_id}/{vehicle_id} seq={report.seq} {body}")
+            self._log(f"[RxReport] {team_id}/{vehicle_id} seq={report.seq} {body}")
             matched = self.incidents.on_report(team_id, vehicle_id, report)
             if matched:
-                self.log_panel.append_log(matched)
+                self._log(matched)
         if is_new and (team_id, vehicle_id) in self.fleet.vehicles:
-            self.log_panel.append_log(f"New vehicle reporting: {team_id}/{vehicle_id}")
+            self._log(f"New vehicle reporting: {team_id}/{vehicle_id}")
             self._sync_team_filter()
 
     def _on_request(self, team_id: str, request):
-        self.log_panel.append_log(
+        if request.WhichOneof("body") == "run_declaration" and self.recorder.is_active(team_id):
+            self._close_run_log(team_id, "team declared a new run")     # new run request
+        self._log(
             f"[RxRequest] {team_id} seq={request.seq} {request.WhichOneof('body')}")
         self._log_notices(self.fleet.ingest_request(team_id, request))
         self._sync_team_filter()
 
     def _on_command(self, team_id: str, command):
-        self.log_panel.append_log(
+        notices = self.fleet.ingest_command(team_id, command)
+        team = self.fleet.teams.get(team_id)
+        if command.WhichOneof("body") == "run_start" and team is not None:
+            if self.recorder.is_active(team_id):
+                self._close_run_log(team_id, f"superseded by RunStart run_id={team.run_id}")
+            self.recorder.begin(team_id, team.run_id, team.declaration_seq)
+        self._log(
             f"[RxCommand] {team_id} seq={command.seq} {command.WhichOneof('body')}")
-        self._log_notices(self.fleet.ingest_command(team_id, command))
+        self._log_notices(notices)
         self._sync_team_filter()
+
+    # ---------- run end (host only: the protocol has no run-end message) ----------
+    def _end_run(self, team_id: str):
+        team = self.fleet.teams.get(team_id)
+        if team is None or team.run_id is None:
+            return
+        if not self._confirm(
+                "End run?", f"End {team_id} run {team.run_id}?\n\nThe run log is saved and "
+                            f"the team waits for its next RunDeclaration. Nothing is sent to "
+                            f"the team (the protocol has no run-end message)."):
+            return
+        path = self._close_run_log(team_id, "ended by host")
+        run_id = self.fleet.end_run(team_id)
+        self.incidents.clear_team(team_id)
+        where = f"log saved to {path}" if path else "no log (run started before this console connected)"
+        self._log(f"[RUN END] {team_id} run {run_id} ended by host; {where}")
+        self.statusBar().showMessage(f"{team_id} run {run_id} ended — {where}")
+        self.refresh_views()
+
+    def _reset_counters(self, team_id: str):
+        team = self.fleet.teams.get(team_id)
+        if team is None or team.run_id is not None:
+            return
+        if not self._confirm(
+                "Reset run ID & seq?",
+                f"Restart {team_id} at Run ID 1 and command seq 1?\n\nOnly do this between runs: "
+                f"until {team_id} declares a new run, its GCS drops a repeated seq as a duplicate."):
+            return
+        self.sender.reset(team_id)
+        self.fleet.reset_counters(team_id)
+        self._log(f"[RESET] {team_id} run ID -> 1, command seq -> 1")
+        self.statusBar().showMessage(f"{team_id}: next Run ID 1, next command seq 1")
+        self.refresh_views()
+
+    def _close_run_log(self, team_id: str, reason: str):
+        path = self.recorder.finish(team_id, reason, self._run_summary(team_id))
+        if path is not None and reason != "ended by host":
+            self._log(f"[RUN LOG] {team_id} previous run closed ({reason}); saved to {path}")
+        return path
+
+    def _run_summary(self, team_id: str):
+        now = time.time()
+        team = self.fleet.teams.get(team_id)
+        lines = []
+        if team is not None:
+            tiers = " ".join(task_tier_name(t) for t in team.tiers)
+            lines.append(f"declared vehicles {', '.join(team.declared_vehicles) or '—'}  ·  "
+                         f"tiers T1–T4 {tiers}")
+        for v in self.fleet.vehicles_of(team_id):
+            age = v.age(now)
+            seen = "never" if age is None else f"{format_duration(age)} ago"
+            reports = ", ".join(f"{k}×{n}" for k, n in sorted(v.reports.items())) or "none"
+            lines.append(f"{v.vehicle_id}: last heartbeat {seen}, report seq {v.last_seq}, "
+                         f"missed {v.seq_missed}, out of order {v.seq_out_of_order}, "
+                         f"restarts {v.seq_restarts}; task reports: {reports}")
+        for e in reversed(self.incidents.entries(team_id)):
+            lines.append(f"Task 4 seq={e.seq} {e.kind} ({e.summary}) -> {e.status}")
+        return lines
 
     # ---------- views ----------
     def selected_team(self):
@@ -397,17 +468,17 @@ class MainWindow(QMainWindow):
                 continue
             self._team_links[tid] = link
             if link == "LOST":
-                self.log_panel.append_log(
+                self._log(
                     f"[WARN] {tid} GCS link lost: no heartbeat for {format_age(age)}")
             elif link == "NO HEARTBEAT" and age > STALE_SECONDS:
-                self.log_panel.append_log(
+                self._log(
                     f"[WARN] {tid} GCS sent no heartbeats ({format_age(age)} since its last "
                     f"message); is the vehicle side publishing?")
             elif link == "NO HEARTBEAT":
                 self._team_links.pop(tid, None)     # re-check once the grace period passes
                 continue
             elif link == "UP" and previous in ("LOST", "NO HEARTBEAT"):
-                self.log_panel.append_log(f"{tid} GCS link restored")
+                self._log(f"{tid} GCS link restored")
 
     def _refresh_header(self, team, now):
         teams = [self.fleet.teams[t] for t in self.fleet.team_ids() if team in (None, t)]
@@ -446,11 +517,17 @@ class MainWindow(QMainWindow):
         self.team_filter.setCurrentText(current if current in teams else ALL_TEAMS)
         self.team_filter.blockSignals(False)
 
+    def _log(self, text: str):
+        self.log_panel.append_log(text)
+        self.recorder.note(f"[{time.strftime('%H:%M:%S')}] {text}")
+
     def _log_notices(self, notices):
         for line in notices:
-            self.log_panel.append_log(line)
+            self._log(line)
 
     def closeEvent(self, event):
+        for team_id in self.recorder.active_teams():
+            self._close_run_log(team_id, "console closed during the run")
         self.mqtt.stop()
         self.mqtt.wait(2000)
         event.accept()

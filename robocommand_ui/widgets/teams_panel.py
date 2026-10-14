@@ -30,6 +30,7 @@ RUN_COLORS = {
     "DECLARED": theme.WARN,
     "ACTIVE": theme.OK,
     "DECL MISMATCH": theme.FAULT,
+    "ENDED": theme.INFO,
 }
 COLUMNS = ["Team", "Run", "Live", "Tiers", "Run ID"]
 TIER_SHORT = {"NONE": "–", "CORE": "C", "ADVANCED": "A", "DISRUPTIVE": "D", "UNKNOWN": "?"}

@@ -181,6 +181,25 @@ class TestRunState(unittest.TestCase):
         self.assertEqual(fleet.teams[TEAM].run_state, "ACTIVE")
         self.assertIn("not seen", notices[0])
 
+    def test_host_ends_the_run_and_a_new_declaration_reopens_it(self):
+        fleet = FleetState()
+        fleet.ingest_request(TEAM, declaration(3))
+        fleet.ingest_command(TEAM, run_start(3, run_id=7))
+        self.assertEqual(fleet.end_run(TEAM), 7)
+        team = fleet.teams[TEAM]
+        self.assertEqual((team.run_state, team.run_id, team.last_run_id), ("ENDED", None, 7))
+        fleet.ingest_request(TEAM, declaration(4))            # the team's next run request
+        self.assertEqual(team.run_state, "DECLARED")
+        fleet.ingest_command(TEAM, run_start(4, run_id=8))
+        self.assertEqual(team.run_state, "ACTIVE")
+
+    def test_ending_a_team_without_a_run_does_nothing(self):
+        fleet = FleetState()
+        fleet.ingest_request(TEAM, declaration(3))
+        self.assertIsNone(fleet.end_run(TEAM))
+        self.assertIsNone(fleet.end_run("NOPE"))
+        self.assertEqual(fleet.teams[TEAM].run_state, "DECLARED")
+
     def test_task_report_contents_are_kept_for_the_map(self):
         fleet = FleetState()
         report = rx_reports_pb2.RxReport(

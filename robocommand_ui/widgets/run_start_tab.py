@@ -3,6 +3,10 @@
 Replaces ``rc run-start --team … --declaration-seq … --run-id …``. Each team
 whose GCS sent a RunDeclaration is listed; pick one and press **Allow start**.
 The declaration seq comes from the declaration itself, so it always matches.
+
+**End run** closes an ACTIVE run on this host (the protocol has no run-end
+message): the run log is saved and the team shows ENDED until its GCS sends
+a new RunDeclaration, which then appears here as DECLARED.
 """
 
 import time
@@ -22,25 +26,29 @@ from robocommand_ui.widgets.panel import Panel
 from robocommand_ui.widgets.teams_panel import RUN_COLORS
 
 COLUMNS = ["Team", "State", "Decl seq", "Vehicles", "Live", "Tiers T1–T4", "Run ID"]
-STATE_ORDER = {"DECLARED": 0, "DECL MISMATCH": 1, "ACTIVE": 2}
+STATE_ORDER = {"DECLARED": 0, "DECL MISMATCH": 1, "ACTIVE": 2, "ENDED": 3}
+NEW_RUN_HINT = ("Waiting for the team's new RunDeclaration. nala2-report GCS: "
+                "ros2 service call /nala2_report/new_run std_srvs/srv/Trigger")
 MAX_RUN_ID = 1_000_000
 
 
 def requesting_teams(fleet: FleetState) -> List[TeamState]:
     """Teams that declared a run: waiting ones first, then the rest by name."""
     teams = [t for t in fleet.teams.values()
-             if t.declaration_seq is not None or t.run_id is not None]
+             if t.declaration_seq is not None or t.run_id is not None or t.ended]
     return sorted(teams, key=lambda t: (STATE_ORDER.get(t.run_state, 3), t.team_id))
 
 
 class RunStartTab(QWidget):
     start_requested = pyqtSignal(str, int, int)     # team_id, declaration_seq, run_id
+    end_requested = pyqtSignal(str)                 # team_id
+    reset_requested = pyqtSignal(str)               # team_id
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self._teams = {}
         self._connected = False
-        self._run_id_team = None        # team whose run id the spinbox was filled for
+        self._run_id_for = None         # (team, declaration seq) the run id was suggested for
 
         row = QHBoxLayout(self)
         row.setContentsMargins(20, 16, 20, 16)
@@ -91,10 +99,22 @@ class RunStartTab(QWidget):
         self.start_btn.setMinimumHeight(36)
         self.start_btn.clicked.connect(self._on_start)
         panel.body.addWidget(self.start_btn)
+        self.end_btn = button("End run", "Danger",
+                              "End this team's run on the host: save the run log and wait "
+                              "for the team's next RunDeclaration")
+        self.end_btn.clicked.connect(self._on_end)
+        panel.body.addWidget(self.end_btn)
         panel.body.addWidget(caption(
             "Check before starting: vehicles LIVE, tiers as briefed, and the UAV geofence "
             "inside the course on the Map tab."))
         panel.body.addStretch()
+        self.reset_btn = button("Reset run ID && seq", "Ghost",
+                                "Suggest Run ID 1 and restart this team's command seq at 1")
+        self.reset_btn.clicked.connect(self._on_reset)
+        panel.body.addWidget(self.reset_btn)
+        panel.body.addWidget(caption(
+            "Only between runs (DECLARED or ENDED): the GCS drops a repeated seq as a duplicate "
+            "until the team declares a new run."))
         return panel
 
     # ---------- state ----------
@@ -159,12 +179,23 @@ class RunStartTab(QWidget):
             self.selected_label.setText("Select a team from the list")
             self.detail.setText("")
             self.start_btn.setEnabled(False)
-            self._run_id_team = None
+            self.end_btn.setEnabled(False)
+            self.reset_btn.setEnabled(False)
+            self._run_id_for = None
             return
-        if team_id != self._run_id_team:
-            self.run_id.setValue((team.run_id or 0) + 1)
-            self._run_id_team = team_id
+        key = (team_id, team.declaration_seq, team.last_run_id)     # new team, run request or end
+        if key != self._run_id_for:
+            self.run_id.setValue((team.run_id or team.last_run_id or 0) + 1)
+            self._run_id_for = key
         state = team.run_state
+        self.end_btn.setEnabled(team.run_id is not None)
+        self.reset_btn.setEnabled(team.run_id is None)
+        if state == "ENDED":
+            self.selected_label.setText(f"{team_id} · ENDED (run {team.last_run_id})")
+            self.detail.setText(NEW_RUN_HINT)
+            self.start_btn.setText("Allow start")
+            self.start_btn.setEnabled(False)
+            return
         self.selected_label.setText(f"{team_id} · {state}")
         self.detail.setText(
             f"Declaration seq {team.declaration_seq}  ·  vehicles "
@@ -172,6 +203,17 @@ class RunStartTab(QWidget):
             + ("" if self._connected else "\nConnect to the broker to send."))
         self.start_btn.setText("Restart run" if state == "ACTIVE" else "Allow start")
         self.start_btn.setEnabled(self._connected and team.declaration_seq is not None)
+
+    def _on_reset(self) -> None:
+        team_id = self.selected_team()
+        if team_id:
+            self.reset_requested.emit(team_id)
+            self._run_id_for = None         # re-suggest the Run ID from the reset counters
+
+    def _on_end(self) -> None:
+        team_id = self.selected_team()
+        if team_id:
+            self.end_requested.emit(team_id)
 
     def _on_start(self) -> None:
         team_id = self.selected_team()
