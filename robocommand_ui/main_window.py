@@ -1,32 +1,38 @@
-"""Main window of the RoboCommand host monitor.
+"""Main window of the RoboCommand host console.
 
-Runs on the course RoboCommand host (e.g. 192.168.65.2 for Course Alpha) and
-shows what every team's GCS/OCS reports to it: the boat movement on a course
-map, per-vehicle telemetry, and each team's run status. It only listens on
-``robocommand/robotx/#`` and never publishes.
+Runs on the course RoboCommand host (e.g. 192.168.65.2 for Course Alpha). It
+shows what every team's GCS/OCS reports to it, and sends what RoboCommand
+sends, so no ``test_client.py`` terminal is needed:
 
-Layout: a header (brand, course/run/live chips, team filter, connection),
-the course map with the log drawer beneath it, and a right rail with teams,
-vehicles and the course summary.
+- **Map**: boat movement on the course map, telemetry, teams, message log
+- **Course**: edit and publish the retained RxCourse, with saved presets
+- **Run start**: teams that declared a run; pick one and allow the start
+- **Task 4**: Core / Advanced / Disruptive incident commands and their acks
+
+Nothing is published unless the operator presses a send button.
 """
 
 import time
 
 from PyQt5.QtCore import Qt, QTimer
 from PyQt5.QtWidgets import (
-    QApplication, QComboBox, QFrame, QHBoxLayout, QLabel, QMainWindow, QScrollArea,
-    QSplitter, QVBoxLayout, QWidget,
+    QApplication, QComboBox, QFrame, QHBoxLayout, QLabel, QMainWindow, QMessageBox,
+    QScrollArea, QSplitter, QTabWidget, QVBoxLayout, QWidget,
 )
 
-from robocommand_ui import theme
+from robocommand_ui import commands, theme
 from robocommand_ui.course_validation import validate_course
 from robocommand_ui.fleet_state import STALE_SECONDS, FleetState
+from robocommand_ui.incident_log import IncidentLog
 from robocommand_ui.mqtt_worker import MqttWorker
 from robocommand_ui.widgets.connection_bar import ConnectionBar
 from robocommand_ui.widgets.course_map import CourseMapWidget
 from robocommand_ui.widgets.course_panel import CoursePanel
+from robocommand_ui.widgets.course_tab import CourseTab
 from robocommand_ui.widgets.log_panel import LogPanel
 from robocommand_ui.widgets.panel import make_chip, set_chip
+from robocommand_ui.widgets.run_start_tab import RunStartTab
+from robocommand_ui.widgets.task4_tab import Task4Tab
 from robocommand_ui.widgets.teams_panel import RUN_COLORS, TeamsPanel, format_age
 from robocommand_ui.widgets.vehicle_monitor import VehicleMonitorPanel
 
@@ -35,10 +41,18 @@ REFRESH_MS = 500            # matches the 2 Hz heartbeat rate
 RAIL_WIDTH = 440
 
 
+def course_center(ring):
+    """Mean of the distinct corners, or None without a course."""
+    points = ring[:-1] if len(ring) > 1 and ring[0] == ring[-1] else ring
+    if not points:
+        return None
+    return (sum(p[0] for p in points) / len(points), sum(p[1] for p in points) / len(points))
+
+
 class MainWindow(QMainWindow):
-    def __init__(self):
+    def __init__(self, presets_path=None):
         super().__init__()
-        self.setWindowTitle("RoboCommand Host Monitor — RobotX 2026")
+        self.setWindowTitle("RoboCommand Host Console — RobotX 2026")
         self.setMinimumSize(1280, 780)
         self.resize(1560, 960)
         app = QApplication.instance()
@@ -48,6 +62,9 @@ class MainWindow(QMainWindow):
         self.fleet = FleetState()
         self._team_links = {}       # team_id -> last logged link state
         self.mqtt = MqttWorker(self)
+        self.incidents = IncidentLog()
+        self.sender = commands.CommandSender(self._publish, self._seen_command_seq)
+        self._presets_path = presets_path
 
         root = QWidget()
         root.setObjectName("Root")
@@ -56,7 +73,7 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
         layout.addWidget(self._build_header())
-        layout.addWidget(self._build_body(), 1)
+        layout.addWidget(self._build_tabs(), 1)
 
         self.statusBar().showMessage("Ready. Choose the broker and press Connect.")
         self._connect_signals()
@@ -70,14 +87,14 @@ class MainWindow(QMainWindow):
         header = QFrame()
         header.setObjectName("Header")
         row = QHBoxLayout(header)
-        row.setContentsMargins(16, 10, 16, 10)
+        row.setContentsMargins(20, 12, 20, 12)
         row.setSpacing(10)
 
         brand = QVBoxLayout()
-        brand.setSpacing(0)
-        title = QLabel("ROBOCOMMAND")
+        brand.setSpacing(2)
+        title = QLabel("RoboCommand host console")
         title.setObjectName("Brand")
-        sub = QLabel("Host monitor · listen-only")
+        sub = QLabel("Course host · RoboCommand ⇄ OCS · RobotX 2026 §3.4")
         sub.setObjectName("BrandSub")
         brand.addWidget(title)
         brand.addWidget(sub)
@@ -110,14 +127,33 @@ class MainWindow(QMainWindow):
 
         self.connection_bar = ConnectionBar()
         row.addWidget(self.connection_bar)
+
+        clock = QVBoxLayout()
+        clock.setSpacing(0)
+        self.clock_label = QLabel("")
+        self.clock_label.setObjectName("Clock")
+        self.clock_label.setAlignment(Qt.AlignRight)
+        self.clock_date = QLabel("")
+        self.clock_date.setObjectName("ClockDate")
+        self.clock_date.setAlignment(Qt.AlignRight)
+        clock.addWidget(self.clock_label)
+        clock.addWidget(self.clock_date)
+        row.addSpacing(8)
+        row.addLayout(clock)
+        self._tick_clock()
         return header
+
+    def _tick_clock(self):
+        now = time.localtime()
+        self.clock_label.setText(time.strftime("%H:%M:%S", now))
+        self.clock_date.setText(time.strftime("%a %d %b %Y", now))
 
     def _build_body(self):
         body = QSplitter(Qt.Horizontal)
-        body.setHandleWidth(10)
+        body.setHandleWidth(16)
 
         left = QSplitter(Qt.Vertical)
-        left.setHandleWidth(10)
+        left.setHandleWidth(16)
         self.course_map = CourseMapWidget()
         left.addWidget(self.course_map)
         self.log_panel = LogPanel()
@@ -152,9 +188,21 @@ class MainWindow(QMainWindow):
 
         wrap = QWidget()
         wl = QVBoxLayout(wrap)
-        wl.setContentsMargins(10, 10, 10, 10)
+        wl.setContentsMargins(20, 16, 20, 16)
         wl.addWidget(body)
         return wrap
+
+    def _build_tabs(self):
+        self.tabs = QTabWidget()
+        self.tabs.setDocumentMode(True)
+        self.tabs.addTab(self._build_body(), "MAP")
+        self.course_tab = CourseTab(self._presets_path)
+        self.tabs.addTab(self.course_tab, "COURSE")
+        self.run_start_tab = RunStartTab()
+        self.tabs.addTab(self.run_start_tab, "RUN START")
+        self.task4_tab = Task4Tab()
+        self.tabs.addTab(self.task4_tab, "TASK 4")
+        return self.tabs
 
     # ---------- signal wiring ----------
     def _connect_signals(self):
@@ -166,9 +214,16 @@ class MainWindow(QMainWindow):
         self.mqtt.connection_error.connect(self._on_mqtt_error)
         self.mqtt.log_message.connect(self.log_panel.append_log)
         self.mqtt.course_received.connect(self._on_course_received)
+        self.mqtt.course_cleared.connect(self._on_course_cleared)
         self.mqtt.report_received.connect(self._on_report)
         self.mqtt.request_received.connect(self._on_request)
         self.mqtt.command_received.connect(self._on_command)
+
+        self.course_tab.publish_requested.connect(self._publish_course)
+        self.course_tab.clear_requested.connect(self._clear_course)
+        self.course_tab.log.connect(self.log_panel.append_log)
+        self.run_start_tab.start_requested.connect(self._start_run)
+        self.task4_tab.command_requested.connect(self._send_task4)
 
     # ---------- connection ----------
     def _on_connect(self, host: str, port: int):
@@ -184,21 +239,96 @@ class MainWindow(QMainWindow):
 
     def _on_mqtt_connected(self):
         self.connection_bar.set_connected(True)
-        self.statusBar().showMessage(f"Monitoring {self.mqtt.broker} (listen-only)")
+        self._set_tabs_connected(True)
+        self.statusBar().showMessage(f"Connected to {self.mqtt.broker}")
 
     def _on_mqtt_disconnected(self):
         self.connection_bar.set_connected(False)
+        self._set_tabs_connected(False)
         self.statusBar().showMessage("Disconnected.")
 
     def _on_mqtt_error(self, err: str):
         self.connection_bar.set_error(err)
+        self._set_tabs_connected(False)
         self.statusBar().showMessage(f"Connection error: {err}")
+
+    def _set_tabs_connected(self, connected: bool):
+        self.run_start_tab.set_connected(connected)
+        self.task4_tab.set_connected(connected)
+
+    # ---------- sending (as RoboCommand) ----------
+    def _publish(self, topic: str, payload: bytes, retain: bool):
+        return self.mqtt.publish(topic, payload, retain)
+
+    def _seen_command_seq(self, team_id: str) -> int:
+        team = self.fleet.teams.get(team_id)
+        return team.last_command_seq if team else 0
+
+    def _report_send(self, what: str, result) -> bool:
+        if result.ok:
+            self.statusBar().showMessage(f"Sent {what}")
+            return True
+        msg = f"Could not send {what}: {result.error}"
+        self.log_panel.append_log(f"[ERROR] {msg}")
+        self.statusBar().showMessage(msg)
+        QMessageBox.warning(self, "Not sent", msg)
+        return False
+
+    def _confirm(self, title: str, text: str) -> bool:
+        return QMessageBox.question(self, title, text) == QMessageBox.Yes
+
+    def _publish_course(self, course):
+        active = [t.team_id for t in self.fleet.teams.values() if t.run_state == "ACTIVE"]
+        if active and not self._confirm(
+                "Replace the course?",
+                f"{', '.join(active)} is running. Publishing a new course changes the boundary "
+                f"its GCS uses mid-run. Publish anyway?"):
+            return
+        if self._report_send(f"course {course.course_id}", self.sender.send_course(course)):
+            self.log_panel.append_log(f"[SENT] RxCourse {course.course_id} "
+                                      f"({len(course.corners)} corners, retained)")
+
+    def _clear_course(self):
+        if self._report_send("course clear", self.sender.clear_course()):
+            self.log_panel.append_log("[SENT] cleared retained RxCourse")
+
+    def _start_run(self, team_id: str, declaration_seq: int, run_id: int):
+        team = self.fleet.teams.get(team_id)
+        if team is not None and team.run_state == "ACTIVE" and not self._confirm(
+                "Restart run?", f"{team_id} is already ACTIVE (run {team.run_id}). "
+                                f"Send RunStart again with run {run_id}?"):
+            return
+        self._send_command(team_id, commands.run_start(declaration_seq, run_id),
+                           f"decl seq={declaration_seq} run_id={run_id}")
+
+    def _send_task4(self, team_id: str, body, summary: str):
+        team = self.fleet.teams.get(team_id)
+        state = team.run_state if team else "unknown"
+        if state != "ACTIVE" and not self._confirm(
+                "Team not active", f"{team_id} is {state}, not ACTIVE. Send {body[0]} anyway?"):
+            return
+        self._send_command(team_id, body, summary)
+
+    def _send_command(self, team_id: str, body, summary: str):
+        name, msg = body
+        result = self.sender.send_command(team_id, body)
+        if not self._report_send(f"{name} to {team_id}", result):
+            return
+        self.log_panel.append_log(f"[SENT] {team_id} seq={result.seq} {name}: {summary}")
+        if name != "run_start":
+            self.incidents.record(team_id, result.seq, name, summary)
+        if name == "readiness_confirm":
+            self.incidents.mark_confirmed(team_id, msg.vehicle_id, msg.report_seq)
+        self.refresh_views()
 
     # ---------- received ----------
     def _on_course_received(self, course):
         issues = validate_course(course)
         self.course_panel.update_course(course)
         self.course_map.set_course(course)
+        self.course_tab.show_broker_course(course)
+        ring = [(c.latitude, c.longitude) for c in course.corners]
+        self.task4_tab.set_course(ring, course_center(ring))
         name = course.course_id or "<no id>"
         if issues:
             set_chip(self.course_id_label, f"COURSE {name} · INVALID", theme.FAULT)
@@ -212,12 +342,20 @@ class MainWindow(QMainWindow):
                                             f"{len(course.corners)} corners")
             self.log_panel.append_log(f"[RxCourse] {name} valid")
 
+    def _on_course_cleared(self):
+        self.course_tab.show_broker_course(None)
+        set_chip(self.course_id_label, "COURSE —", theme.IDLE)
+        self.log_panel.append_log("[RxCourse] retained course cleared")
+
     def _on_report(self, team_id: str, vehicle_id: str, report):
         is_new = (team_id, vehicle_id) not in self.fleet.vehicles
         self._log_notices(self.fleet.ingest_report(team_id, vehicle_id, report))
         body = report.WhichOneof("body")
         if body and body != "heartbeat":
             self.log_panel.append_log(f"[RxReport] {team_id}/{vehicle_id} seq={report.seq} {body}")
+            matched = self.incidents.on_report(team_id, vehicle_id, report)
+            if matched:
+                self.log_panel.append_log(matched)
         if is_new and (team_id, vehicle_id) in self.fleet.vehicles:
             self.log_panel.append_log(f"New vehicle reporting: {team_id}/{vehicle_id}")
             self._sync_team_filter()
@@ -242,9 +380,12 @@ class MainWindow(QMainWindow):
     def refresh_views(self):
         now = time.time()
         team = self.selected_team()
+        self._tick_clock()
         self.course_map.show_fleet(self.fleet, team, now)
         self.vehicle_monitor.refresh(self.fleet, team, now)
         self.teams_panel.refresh(self.fleet, now)
+        self.run_start_tab.refresh(self.fleet, now)
+        self.task4_tab.refresh(self.fleet, self.incidents, self.sender.next_seq, now)
         self._log_link_changes(now)
         self._refresh_header(team, now)
 

@@ -6,6 +6,9 @@ TEAM/VEHICLE, dimmed when its heartbeats go stale), and the latest Task 1
 buoys / Task 2 pipeline reports. Positions are projected to metres around
 the course so the grid and scale bar are true distances.
 
+Satellite imagery (same source as the OCS map, cached on disk) is drawn
+underneath when available; **Satellite** toggles it.
+
 Mouse: wheel zooms about the cursor, drag pans, double-click re-fits.
 """
 
@@ -21,11 +24,15 @@ from robocommand_ui import theme
 from robocommand_ui.fleet_state import STALE_SECONDS
 from robocommand_ui.proto_helper import rx_common_pb2, vehicle_type_name
 from robocommand_ui.widgets.panel import Panel
+from robocommand_ui.widgets.tiles import (
+    ATTRIBUTION, MAX_ZOOM, shared_loader, unit_to_latlng, unit_xy,
+)
 
 LatLng = Tuple[float, float]
 M_PER_DEG_LAT = 111_320.0
 GRID_STEPS_M = (1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000)
 MIN_GRID_PX = 64
+EARTH_M_PER_PX_Z0 = 156_543.033928
 FIT_MARGIN = 0.12
 
 # Real-world buoy beacon colours (data, not UI status)
@@ -47,6 +54,15 @@ class CourseMapWidget(Panel):
         super().__init__("Course map", parent, body_margins=(0, 0, 0, 0))
         self._canvas = MapCanvas(self)
         self.body.addWidget(self._canvas, 1)
+
+        self.sat_btn = QPushButton("Satellite")
+        self.sat_btn.setObjectName("Ghost")
+        self.sat_btn.setCheckable(True)
+        self.sat_btn.setChecked(True)
+        self.sat_btn.setCursor(Qt.PointingHandCursor)
+        self.sat_btn.setToolTip("Satellite imagery under the course (cached for offline use)")
+        self.sat_btn.toggled.connect(self._canvas.set_show_tiles)
+        self.actions.addWidget(self.sat_btn)
 
         self.trails_btn = QPushButton("Trails")
         self.trails_btn.setObjectName("Ghost")
@@ -127,6 +143,9 @@ class MapCanvas(QWidget):
         self._pl_active: Optional[LatLng] = None
         self._pl_segments: List[int] = []
         self._show_trails = True
+        self._show_tiles = True
+        self._tiles = shared_loader()
+        self._tiles.updated.connect(self.update)
         # view: local metres -> pixels
         self._origin: Optional[LatLng] = None
         self._scale = 1.0                     # px per metre
@@ -157,6 +176,10 @@ class MapCanvas(QWidget):
     def clear_task_data(self):
         self._sp_entry = self._sp_exit = self._pl_active = None
         self._sp_buoys, self._pl_segments = [], []
+
+    def set_show_tiles(self, on: bool):
+        self._show_tiles = on
+        self.update()
 
     def set_show_trails(self, on: bool):
         self._show_trails = on
@@ -256,7 +279,9 @@ class MapCanvas(QWidget):
         if not self._user_view:
             self._fit()
 
-        self._draw_grid(p)
+        drew_tiles = self._show_tiles and self._draw_tiles(p)
+        if not drew_tiles:
+            self._draw_grid(p)
         self._draw_boundary(p)
         self._draw_geofence(p)
         self._draw_tasks(p)
@@ -265,6 +290,39 @@ class MapCanvas(QWidget):
         self._draw_vehicles(p)
         self._draw_scale_and_north(p)
         self._draw_legend(p)
+
+    def _px_to_latlng(self, q: QPointF) -> LatLng:
+        x, y = self._px_to_m(q)
+        lat0, lng0 = self._origin
+        return (lat0 + y / M_PER_DEG_LAT,
+                lng0 + x / (M_PER_DEG_LAT * math.cos(math.radians(lat0))))
+
+    def _draw_tiles(self, p) -> bool:
+        """Satellite tiles under the course; False when none are available."""
+        lat0 = self._origin[0]
+        mpp = 1.0 / self._scale
+        z = int(max(0, min(MAX_ZOOM, round(math.log2(
+            EARTH_M_PER_PX_Z0 * math.cos(math.radians(lat0)) / mpp)))))
+        n = 1 << z
+        ux0, uy0 = unit_xy(*self._px_to_latlng(QPointF(0, 0)))
+        ux1, uy1 = unit_xy(*self._px_to_latlng(QPointF(self.width(), self.height())))
+        drew = False
+        for tx in range(math.floor(ux0 * n), math.floor(ux1 * n) + 1):
+            for ty in range(max(0, math.floor(uy0 * n)), min(n - 1, math.floor(uy1 * n)) + 1):
+                pix = self._tiles.tile(z, tx, ty)
+                if pix is None:
+                    continue
+                nw = self.to_px(*unit_to_latlng(tx / n, ty / n))
+                se = self.to_px(*unit_to_latlng((tx + 1) / n, (ty + 1) / n))
+                p.drawPixmap(QRectF(nw, se).adjusted(0, 0, 0.5, 0.5), pix, QRectF(pix.rect()))
+                drew = True
+        if drew:
+            p.fillRect(self.rect(), theme.qcolor(theme.BG, 70))     # keep overlays readable
+            p.setPen(theme.qcolor(theme.TEXT_MUTED))
+            p.setFont(theme.ui_font(7.5))
+            p.drawText(QRectF(0, self.height() - 16, self.width(), 14), Qt.AlignCenter,
+                       ATTRIBUTION)
+        return drew
 
     def _draw_empty(self, p):
         p.setPen(theme.qcolor(theme.TEXT_MUTED))

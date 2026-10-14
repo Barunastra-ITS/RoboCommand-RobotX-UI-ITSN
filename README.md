@@ -4,7 +4,7 @@ Two programs for the RobotX 2026 communications protocol (Team Handbook §3.4):
 
 | Program | Runs on | Does |
 |---|---|---|
-| `run_ui.py` — **Host Monitor** (Qt) | The course RoboCommand host, e.g. `192.168.65.2` | Listens to everything teams report and shows each team's boat movement |
+| `run_ui.py` — **Host Console** (Qt) | The course RoboCommand host, e.g. `192.168.65.2` | Shows everything teams report (boat movement, telemetry) and sends what RoboCommand sends: course, RunStart, Task 4 |
 | `report.py` — **GCS Reporter** | The team GCS/OCS | Finds the course host, connects to it, declares the run, sends 2 Hz heartbeats |
 
 ```
@@ -43,8 +43,25 @@ python3 run_ui.py        # or ./run_ui.sh, which also starts a local broker if n
 Leave the preset on **This host (localhost)** and press **Connect**. The course
 presets connect to a course broker from another machine instead.
 
-The monitor subscribes to `robocommand/robotx/#` and **never publishes**, so it
-cannot interfere with a run. It shows:
+The console subscribes to `robocommand/robotx/#` and publishes **only when you
+press a send button**. It has four tabs:
+
+| Tab | Does | Replaces |
+|---|---|---|
+| **Map** | Monitor: the panels below | — |
+| **Course** | Edit and publish the retained `RxCourse`. Built-in and saved presets (`~/.config/robocommand_ui/course_presets.json`), live validity, ring closed automatically, clear the retained course. **Boundary map:** type a centre lat/lng → **Go**, then click the satellite map to pin corners (click an edge to insert, drag to move, right-click to delete); the coordinate table fills itself, and edits to the table move the pins | `rc course …` |
+| **Run start** | Every team that sent a RunDeclaration; select one and press **Allow start** (declaration seq filled in from the declaration) | `rc run-start …` |
+| **Task 4** | Core (assistance request, readiness confirm), Advanced (keep-out zone, all clear), Disruptive (moving object alert). Shows the team's declared tier and a history that matches each command with its IncidentAck / ReadinessReport; the readiness confirm fills itself in | `rc assistance-request …` etc. |
+
+Both maps use the same satellite imagery as the nala2-report OCS (Esri World Imagery), cached in
+`~/.cache/robocommand_ui/tiles`. Course networks have no Internet, so open the Course tab over the
+area once while online; cached tiles then show offline. `ROBOCOMMAND_MAP_TILES=0` turns imagery off.
+
+`RxCommand.seq` is kept per team and continues from the highest seq seen on the broker,
+so it never restarts at 1 mid-run. Sending to a team that is not ACTIVE, restarting an
+ACTIVE run, or replacing the course during a run asks for confirmation first.
+
+The Map tab shows:
 
 | Panel | Shows |
 |---|---|

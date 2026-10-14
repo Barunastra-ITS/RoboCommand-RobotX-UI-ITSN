@@ -7,13 +7,17 @@ host UI run their real code paths: the reporter's heartbeat thread publishes at
 
 import os
 import sys
+import tempfile
 import time
 import unittest
+from pathlib import Path
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+os.environ["ROBOCOMMAND_MAP_TILES"] = "0"          # no satellite fetches from tests
 sys.path.insert(0, ROOT)
 sys.path.insert(0, os.path.join(ROOT, "tests"))
 
+from PyQt5.QtCore import QPointF
 from PyQt5.QtWidgets import QApplication
 
 from fake_broker import FakeBroker
@@ -48,9 +52,18 @@ class TestHostLoopback(unittest.TestCase):
             corners=[common_pb2.LatLng(latitude=a, longitude=b) for a, b in CORNERS])
         cls.broker.publish(f"{TOPIC_ROOT}/course", course.SerializeToString(), retain=True)
 
-        # Host monitor listens to everything
-        cls.win = MainWindow()
+        # Host console listens to everything and publishes through the same broker
+        cls.presets_dir = tempfile.TemporaryDirectory()
+        cls.win = MainWindow(presets_path=Path(cls.presets_dir.name) / "presets.json")
         cls.broker.subscribe(f"{TOPIC_ROOT}/#", lambda m: cls.win.mqtt._on_message(None, None, m))
+        cls.host_published = []
+
+        def host_publish(topic, payload, retain):
+            cls.host_published.append(topic)
+            cls.broker.publish(topic, payload, retain=retain)
+            return None
+        cls.win.mqtt.publish = host_publish
+        cls.win._set_tabs_connected(True)
 
         # GCS reporter on the team side
         cls.reporter = GcsReporter(
@@ -76,6 +89,7 @@ class TestHostLoopback(unittest.TestCase):
     def tearDownClass(cls):
         cls.reporter.stop()
         cls.win.close()
+        cls.presets_dir.cleanup()
 
     def log_text(self):
         return "\n".join(self.win.log_panel._all_messages)
@@ -91,6 +105,55 @@ class TestHostLoopback(unittest.TestCase):
         self.assertEqual(row[2], "2/2")
         self.assertEqual([self.win.team_filter.itemText(i) for i in range(self.win.team_filter.count())],
                          ["All teams", TEAM])
+
+    def test_2b_course_tab_republishes_retained_course(self):
+        tab = self.win.course_tab
+        declared = self.reporter.declaration_seq
+        tab.set_fields("ALPHA", 25000, CORNERS[:-1])        # open ring: closed on publish
+        self.assertTrue(tab.publish_btn.isEnabled())
+        tab.publish_btn.click()
+        drain(0.2)
+        course = rx_course_pb2.RxCourse.FromString(self.broker._retained[f"{TOPIC_ROOT}/course"])
+        self.assertEqual(len(course.corners), 5)
+        self.assertIn("VALID", tab.broker_summary.text())
+        self.assertEqual(self.reporter.declaration_seq, declared)     # GCS did not re-declare
+
+    def test_2b2_pinning_corners_on_the_map_fills_the_table(self):
+        from PyQt5.QtCore import QPoint, Qt
+        from PyQt5.QtTest import QTest
+        tab = self.win.course_tab
+        saved = tab.read_corners()[0]
+        tab.map.resize(600, 400)
+        tab.center_lat.setValue(-7.263)
+        tab.center_lng.setValue(112.793)
+        tab._go_to_center()
+        tab._clear_corners()
+        self.assertEqual(tab.corners.rowCount(), 0)
+        clicks = [QPoint(150, 100), QPoint(450, 100), QPoint(450, 300), QPoint(150, 300)]
+        for pt in clicks:
+            QTest.mouseClick(tab.map, Qt.LeftButton, Qt.NoModifier, pt)
+        corners, error = tab.read_corners()
+        self.assertEqual(error, "")
+        self.assertEqual(len(corners), 4)
+        lat, lng = tab.map.to_latlng(QPointF(150, 100))
+        self.assertAlmostEqual(corners[0][0], lat, places=6)
+        self.assertAlmostEqual(corners[0][1], lng, places=6)
+        self.assertGreater(corners[0][0], corners[3][0])          # first pin is north
+        self.assertIn("VALID", tab.validity.text())
+
+        QTest.mouseClick(tab.map, Qt.RightButton, Qt.NoModifier, clicks[2])   # delete pin 3
+        self.assertEqual(tab.corners.rowCount(), 3)
+        tab.corners.item(0, 0).setText("-7.2620000")               # table edit moves the pin
+        self.assertAlmostEqual(tab.map.corners()[0][0], -7.262)
+        tab.set_fields("ALPHA", 25000, saved)                       # leave it as found
+
+    def test_2c_run_start_tab_lists_the_declared_team(self):
+        tab = self.win.run_start_tab
+        self.assertEqual(tab.table.item(0, 0).text(), TEAM)
+        self.assertEqual(tab.table.item(0, 1).text(), "DECLARED")
+        self.assertEqual(tab.table.item(0, 2).text(), str(self.reporter.declaration_seq))
+        self.assertEqual(tab.selected_team(), TEAM)         # the waiting team is preselected
+        self.assertTrue(tab.start_btn.isEnabled())
 
     def test_3_boat_movement_is_tracked(self):
         usv = self.win.fleet.vehicles[(TEAM, "USV1")]
@@ -109,6 +172,16 @@ class TestHostLoopback(unittest.TestCase):
         self.assertEqual(card._values["State"].text(), "AUTO")
         self.assertEqual(card._values["Flight"].text(), "AIRBORNE")
         self.assertIn("Hz", card.rate.value.text())
+
+    def test_4b_allow_start_from_console(self):
+        tab = self.win.run_start_tab
+        tab.run_id.setValue(7)
+        tab.start_btn.click()
+        drain(0.3)
+        self.win.refresh_views()
+        self.assertEqual(self.reporter.run_id, 7)
+        self.assertEqual(self.win.teams_panel.row_text(TEAM)[1], "ACTIVE")
+        self.assertEqual(tab.start_btn.text(), "Restart run")
 
     def test_5_run_start_seen_by_both_sides(self):
         cmd = rx_commands_pb2.RxCommand(team_id=TEAM, seq=1, sent_at=now_ts(),
@@ -133,6 +206,44 @@ class TestHostLoopback(unittest.TestCase):
         self.win.refresh_views()
         self.assertEqual(len(self.win.course_map._canvas._sp_buoys), 1)
         self.assertIn("safe_passage", self.log_text())
+
+    def test_6b_task4_assistance_ack_readiness_confirm(self):
+        tab = self.win.task4_tab
+        self.assertEqual(tab.selected_team(), TEAM)
+        self.assertEqual(tab.core.meta_label.text(), "not declared")     # reporter's T4 tier is NONE
+        tab.assist_type.setCurrentText("USV")
+        tab.assist_pos.set_value((1.2806, 103.8557))
+        self._click(tab, "Send assistance request")
+        drain(0.2)
+        entry = self.win.incidents.entries(TEAM)[0]
+        self.assertEqual((entry.kind, entry.status), ("assistance_request", "WAITING ACK"))
+        self.assertGreater(entry.seq, 1)                                  # after the RunStarts
+
+        ack = rx_reports_pb2.IncidentAck(command_seq=entry.seq)
+        self.assertTrue(self.reporter.publish_report("USV1", "incident_ack", ack))
+        ready = rx_reports_pb2.ReadinessReport(command_seq=entry.seq)
+        self.assertTrue(self.reporter.publish_report("USV1", "readiness", ready))
+        drain(0.3)
+        self.win.refresh_views()
+        self.assertTrue(entry.status.startswith("READY USV1"), entry.status)
+        report_seq = entry.readiness[1]
+        self.assertEqual(tab.confirm_vehicle.currentText(), "USV1")
+        self.assertEqual(tab.confirm_seq.value(), report_seq)
+
+        self._click(tab, "Send readiness confirm")
+        drain(0.2)
+        self.assertEqual(entry.status, "CONFIRMED")
+        sent = rx_commands_pb2.RxCommand.FromString(
+            [pl for t, pl in self.broker.published if t == f"{TOPIC_ROOT}/{TEAM}/command"][-1])
+        self.assertEqual(sent.readiness_confirm.report_seq, report_seq)
+        self.assertEqual(sent.seq, entry.seq + 1)
+        self.assertEqual(tab.history.item(0, 4).text(), "SENT")          # newest: the confirm
+
+    @staticmethod
+    def _click(tab, text):
+        from PyQt5.QtWidgets import QPushButton
+        [btn] = [b for b in tab.findChildren(QPushButton) if b.text() == text]
+        btn.click()
 
     def test_7_bad_traffic_is_rejected_without_crashing(self):
         self.broker.publish(f"{TOPIC_ROOT}/{TEAM}/USV1/report", b"\xff\xff\xff")
@@ -174,12 +285,11 @@ class TestHostLoopback(unittest.TestCase):
         self.assertIn("Broker", self.win.connection_bar.status_label.text())
         self.win.team_filter.setCurrentText("All teams")
 
-    def test_9_host_never_publishes(self):
-        host_topics = {t for t, _ in self.broker.published
-                       if not t.startswith(f"{TOPIC_ROOT}/{TEAM}/") and t != f"{TOPIC_ROOT}/course"
-                       and not t.startswith(f"{TOPIC_ROOT}/RNRX/")}
-        self.assertEqual(host_topics, set())
-        self.assertFalse(hasattr(self.win.mqtt, "_publish"))
+    def test_9_host_publishes_only_what_the_operator_sent(self):
+        allowed = {f"{TOPIC_ROOT}/course", f"{TOPIC_ROOT}/{TEAM}/command"}
+        self.assertTrue(set(self.host_published) <= allowed, self.host_published)
+        sent_lines = [line for line in self.win.log_panel._all_messages if "[SENT]" in line]
+        self.assertEqual(len(sent_lines), len(self.host_published))
 
 
 if __name__ == "__main__":

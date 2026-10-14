@@ -1,9 +1,9 @@
-"""Passive MQTT monitor for the RoboCommand host (e.g. 192.168.65.2).
+"""MQTT link of the RoboCommand host console (e.g. 192.168.65.2).
 
-The host UI only listens. It subscribes to everything under
-``robocommand/robotx/#`` and emits each decoded envelope with the team and
-vehicle taken from the topic. It never publishes, so it cannot inject
-messages into a live run.
+It subscribes to everything under ``robocommand/robotx/#`` and emits each
+decoded envelope with the team and vehicle taken from the topic. It
+publishes only through ``publish()``, which the console calls when the
+operator presses a send button (course, RunStart, Task 4 commands).
 """
 
 import threading
@@ -30,6 +30,7 @@ class MqttWorker(QThread):
     connection_error = pyqtSignal(str)
 
     course_received = pyqtSignal(object)
+    course_cleared = pyqtSignal()                     # retained course removed
     report_received = pyqtSignal(str, str, object)    # team_id, vehicle_id, RxReport
     request_received = pyqtSignal(str, object)        # team_id, RxRequest
     command_received = pyqtSignal(str, object)        # team_id, RxCommand
@@ -104,6 +105,20 @@ class MqttWorker(QThread):
             except Exception as e:
                 self.log_message.emit(f"disconnect error: {e}")
 
+    def publish(self, topic: str, payload: bytes, retain: bool = False) -> Optional[str]:
+        """Publish from the GUI thread. Returns an error message, or None when queued."""
+        with self._client_lock:
+            client = self._client
+        if client is None or not self._is_connected:
+            return "not connected to the broker"
+        try:
+            info = client.publish(topic, payload, qos=1, retain=retain)
+        except Exception as e:
+            return str(e)
+        if info.rc != mqtt.MQTT_ERR_SUCCESS:
+            return mqtt.error_string(info.rc)
+        return None
+
     def _on_connect(self, client, userdata, flags, reason_code, properties):
         if getattr(reason_code, "is_failure", False):
             self.connection_error.emit(f"broker refused connection: {reason_code}")
@@ -127,6 +142,9 @@ class MqttWorker(QThread):
                 self.log_message.emit(f"[IGNORED] unexpected topic {msg.topic}")
                 return
             kind, team_id, vehicle_id = route
+            if kind == "course" and not msg.payload:
+                self.course_cleared.emit()
+                return
             name, parsed = parse_mqtt_payload(msg.topic, msg.payload)
             if parsed is None or name != EXPECTED_ENVELOPE[kind]:
                 self.log_message.emit(

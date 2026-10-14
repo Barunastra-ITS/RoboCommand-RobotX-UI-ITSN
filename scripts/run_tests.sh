@@ -8,7 +8,7 @@ PY="${PYTHON:-python3}"
 export QT_QPA_PLATFORM="${QT_QPA_PLATFORM:-offscreen}"
 
 rc=0
-for t in tests/test_course_validation.py tests/test_fleet_state.py \
+for t in tests/test_course_validation.py tests/test_fleet_state.py tests/test_console.py \
          tests/test_report.py tests/test_host_loopback.py tests/test_live_broker.py; do
     echo ""
     echo "########## $t ##########"
