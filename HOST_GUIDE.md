@@ -24,6 +24,7 @@ cd ~/github/barunastra-its/RoboCommand-RobotX-UI-ITSN
 | Step | Command | Why |
 |---|---|---|
 | Broker as a system service | `sudo ./scripts/setup_host_broker.sh` | Installs mosquitto, listens on `0.0.0.0:1883`, anonymous, starts on boot. Undo: `sudo ./scripts/setup_host_broker.sh remove` |
+| DHCP for team GCSs | `sudo ./scripts/dhcp/install_dhcp.sh` (`IFACE=… ` for another port than `enp12s0`) | Serves Course Alpha `192.168.65.0/24`, Bravo `.66`, Charlie `.67`, Delta `.68` and Demo `.70` (VLAN 70) (teams get `.15–.254`). dhcpd answers only on the subnet of the wired IP, and a NetworkManager hook restarts it when the link comes up, so **changing course = set the wired IP to that course's `.2`** (e.g. `nmcli con mod robocommand ipv4.addresses 192.168.66.2/24 && nmcli con up robocommand`). Undo: `sudo ./scripts/dhcp/install_dhcp.sh remove` |
 | Python | use `python3.10` (alias `py310`) | The vendored protobuf code needs protobuf ≥ 7.35. `python3.10` has 7.36; plain `python3` (3.12) has 6.33 and fails with `VersionError` |
 
 ## 2. Every session
@@ -59,7 +60,13 @@ python3.10 run_ui.py
 | `· NO HEARTBEAT 8m00s` | The GCS declared but never sent a heartbeat (vehicles not publishing) |
 | `2/3 LIVE` | Vehicles with a heartbeat in the last 2.5 s |
 
-Map: scroll = zoom, drag = pan, double-click or **Fit** = re-fit, **Trails** = toggle tracks.
+Map: scroll = zoom, drag = pan, **Shift+drag** = rotate, compass (top right) = back to north-up,
+double-click or **Fit** = re-fit, **Trails** = toggle tracks,
+**Clear** = remove the trails and Task 1/2 overlays of the team shown (all teams when *All teams*);
+boats stay on the map. RunStart does the same for its team automatically.
+
+**Light / Dark mode** (right end of the tab bar) switches the theme; light is the default and
+the choice is remembered.
 
 `./run_ui.sh` does the same but also installs missing deps and starts a broker if none is
 listening. It calls `python3`, so prefer `python3.10 run_ui.py` on this laptop.
@@ -68,18 +75,21 @@ listening. It calls `python3`, so prefer `python3.10 run_ui.py` on this laptop.
 
 | Tab | Steps | Same as |
 |---|---|---|
-| **Course** | Pick a preset (built-in: `Danau 8`, `Promontory SG`) or type Course ID, pinger, corners → **Publish course (retained)**. **Save as preset…** stores your own in `~/.config/robocommand_ui/course_presets.json`. The ring is closed for you | `rc course …` |
-| **Run start** | When the GCS declares, the team appears as **DECLARED** (preselected) → set Run ID → **Allow start** | `rc run-start --team ITSN --declaration-seq <seq> --run-id <n>` |
-| **Run start → End run** | Run over (time up, judge's call) → select the ACTIVE team → **End run** → confirm. Nothing is sent (the handbook has no run-end message); the run log is saved to `~/.local/share/robocommand_ui/runs/<date>_<team>_run<id>.log` and the team shows **ENDED**. Ask the GCS for the next run (`ros2 service call /nala2_report/new_run std_srvs/srv/Trigger`); its new declaration shows as DECLARED with the next Run ID suggested | — |
+| **Course** | Pick a preset in the **Presets** list on the left (built-in: `Danau 8`, `Promontory SG`): its corners, pinger and map centre fill in. **Course ID** is filled from the course this host serves (its address: `192.168.65.2` → `ALPHA`, `.66.2` → `BRAVO`, `.67.2` → `CHARLIE`, `.68.2` → `DELTA`, `.70.2` → `DEMO`); **This host** puts it back after an edit. **Pinger frequency** is a plain number in Hz → **Publish course (retained)**; *Last published* under the button shows when. **+ Add preset** saves the fields as a new preset (asks a name); **Update preset** overwrites the loaded one without asking (enabled once you change something); **Delete preset** removes a saved one. Saved in `~/.config/robocommand_ui/course_presets.json`. The ring is closed for you | `rc course …` |
+| **Run start** | When the GCS declares, the team appears as **DECLARED** (preselected) → set Run ID → **Allow start**. Enabled only when **every declared vehicle is LIVE and in AUTO** (column *Live+Auto* `n/n`); otherwise the panel lists what is missing (e.g. `USV1 MANUAL (needs AUTO)`, `UAV1 no heartbeat`). On RunStart the team's trails and Task 1/2 overlays are cleared from the map, so every run starts on a clean map | `rc run-start --team ITSN --declaration-seq <seq> --run-id <n>` |
+| **Run start → End run** | Run over (time up, judge's call) → select the ACTIVE team → **End run** → confirm. Nothing is sent (the handbook has no run-end message); the run log is saved to `~/.local/share/robocommand_ui/runs/<date>_<team>_run<id>.log` (plus a `.json` replay) and the team shows **ENDED**. The run appears under **Finished runs** by Run ID. Ask the GCS for the next run (`ros2 service call /nala2_report/new_run std_srvs/srv/Trigger`); its new declaration shows as DECLARED with the next Run ID suggested | — |
+| **Run start → Finished runs** | Select a Run ID → **Replay** (or double-click): the course, UAV geofence, task overlays and every vehicle's track for that run, with Play/Pause, a timeline and 1×–50× speed. **Open log** opens the text log | — |
 | **Run start → Reset run ID & seq** | Bottom of the panel, enabled only between runs (DECLARED or ENDED). Next Run ID back to 1 and this team's command seq back to 1 — e.g. at the start of a new day. Do it after the team's new declaration (or `new_run`): until then the GCS drops a repeated seq as a duplicate | — |
 | **Task 4 → Core** | Vehicle type + point → **Send assistance request**. When the ReadinessReport arrives, *Vehicle ID* and *Report seq R* fill themselves in → **Send readiness confirm** | `assistance-request`, `readiness-confirm` |
 | **Task 4 → Advanced** | Type + centre + radius → **Send keep-out zone**; later **Send all clear** | `keep-out-zone`, `all-clear` |
 | **Task 4 → Disruptive** | Point + heading + speed + affected types → **Send moving object alert**; send again to move it | `moving-object-alert` |
 
 - Positions default to the course centre; each shows *Inside / Outside the course*.
-- **Boundary map** (Course tab, right): type a **Centre** lat/lng → **Go** (or Enter). Click the
+- **Boundary map** (Course tab, right): the **Centre** fields follow the map as you drag or zoom
+  it, so they always show where you are; or type a lat/lng → **Go** (or Enter) to jump. Click the
   satellite map to drop a corner — it fills the table; click an edge to insert one, drag a pin to
-  move it, right-click a pin to delete it, wheel to zoom. Editing the table moves the pins.
+  move it, right-click a pin to delete it, wheel to zoom, **Shift+drag** to rotate; the compass
+  (top right) turns it back to north-up. Editing the table moves the pins.
   **Fit corners** zooms to the pins, **Clear pins** removes them. Loading a preset centres the map.
 - **Imagery offline:** the course network has no Internet. Open the Course tab over your course
   once while online; tiles are cached in `~/.cache/robocommand_ui/tiles` and show offline. Without
@@ -424,7 +434,9 @@ ros2 service call /nala2_report/new_run std_srvs/srv/Trigger
 | `DECL MISMATCH` | RunStart declaration seq ≠ the team's declaration seq. The GCS does **not** pass this RunStart to the boat; use **Allow start** (it takes the seq from the declaration) |
 | Team never `DECLARED` | GCS log `RunDeclaration NOT sent: …` — a UAV declared without a geofence, a geofence point outside the course, or a bad `vehicle_ids`. Fix the GCS parameter |
 | `ACTIVE` but the boat does not move | Check the GCS log for `RunStart verified` — or `NOT forwarded` (declaration mismatch) |
+| Vehicle shown that the OCS no longer declares | A new RunDeclaration replaces the team's vehicle list: vehicles left out are removed from the map and cards (`ITSN/UAV1 removed: not in the new declaration`). A vehicle that reports without being declared is still drawn, with `[WARN] ITSN/UAV1 reports but is not declared` in the log |
 | Same team re-declares between runs | Expected after `new_run` or a different course; Run start lists the new declaration seq |
 | Team stuck `ENDED` | You ended the run; the GCS has not declared again. GCS: `ros2 service call /nala2_report/new_run std_srvs/srv/Trigger` |
-| Where is the run log? | `~/.local/share/robocommand_ui/runs/` — one file per run (also written when a team re-declares mid-run or the console closes during a run) |
-| GCS can't reach the host | `systemctl is-active mosquitto`; the GCS needs a `192.168.65.x` address (no DHCP server on this laptop — bench: give the GCS a static `192.168.65.x/24`) |
+| Where is the run log? | `~/.local/share/robocommand_ui/runs/` — one `.log` + `.json` replay per run (replay it from Run start → Finished runs) (also written when a team re-declares mid-run or the console closes during a run) |
+| GCS can't reach the host | `systemctl is-active mosquitto`; the GCS needs an address on the course network: `systemctl status isc-dhcp-server` (installed by `scripts/dhcp/install_dhcp.sh`, see §1) |
+| Map kept old trails after a run start | Fixed: the console clears the map as soon as its RunStart is sent, and subscribes at QoS 1. **Clear** on the Map tab does it by hand |

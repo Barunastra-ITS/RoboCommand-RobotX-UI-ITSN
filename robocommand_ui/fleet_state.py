@@ -19,13 +19,14 @@ from collections import deque
 from typing import Deque, Dict, List, Optional, Tuple
 
 from robocommand_ui.courses import TOPIC_ROOT
-from robocommand_ui.proto_helper import rx_common_pb2, rx_task_name
+from robocommand_ui.proto_helper import common_pb2, robot_state_name, rx_common_pb2, rx_task_name
 
 TRAIL_LENGTH = 1200          # 10 minutes at 2 Hz
 RATE_WINDOW_S = 5.0
 EXPECTED_HB_HZ = 2.0
 STALE_SECONDS = 2.5          # 2 Hz heartbeats: >2.5 s means several were missed
 OFFLINE_SECONDS = 30.0
+APPLIED_RUN_STARTS = 16       # RunStarts remembered per team to recognise their echoes
 
 LatLng = Tuple[float, float]
 
@@ -66,10 +67,14 @@ class TeamState:
         self.team_id = team_id
         self.declaration_seq: Optional[int] = None
         self.declared_vehicles: List[str] = []
+        self.undeclared_warned: set = set()       # vehicles already warned as undeclared
         self.tiers: Tuple[int, int, int, int] = (0, 0, 0, 0)
         self.geofence: List[LatLng] = []
         self.last_request_seq = 0
         self.last_command_seq = 0
+        # (seq, run_id, declaration_seq) of RunStarts already applied, newest last: an
+        # echo of any of them (late, reordered or a QoS 1 duplicate) is not a new run
+        self.run_start_keys: Deque[Tuple[int, int, int]] = deque(maxlen=APPLIED_RUN_STARTS)
         self.last_seen: Optional[float] = None    # last message from the team's GCS
         self.run_id: Optional[int] = None
         self.run_start_declaration_seq: Optional[int] = None
@@ -176,7 +181,13 @@ class FleetState:
             return [f"[REJECT] report topic {topic_team}/{topic_vehicle} does not match "
                     f"message {report.team_id}/{report.vehicle_id}"]
 
-        self.team(topic_team).last_seen = now
+        team = self.team(topic_team)
+        team.last_seen = now
+        if (team.declared_vehicles and topic_vehicle not in team.declared_vehicles
+                and topic_vehicle not in team.undeclared_warned):
+            team.undeclared_warned.add(topic_vehicle)
+            notices.append(f"[WARN] {topic_team}/{topic_vehicle} reports but is not declared "
+                           f"(declared: {', '.join(team.declared_vehicles)})")
         v = self.vehicle(topic_team, topic_vehicle)
         accepted, seq_notices = self._check_seq(v, report.seq)
         notices.extend(seq_notices)
@@ -213,6 +224,12 @@ class FleetState:
             team.run_id = None
             team.run_start_declaration_seq = None
             team.ended = False
+            team.undeclared_warned = set()
+            # The declaration is the team's vehicle list: drop leftovers from an older one
+            for v in self.vehicles_of(topic_team):
+                if v.vehicle_id not in team.declared_vehicles:
+                    del self.vehicles[v.key]
+                    notices.append(f"{topic_team}/{v.vehicle_id} removed: not in the new declaration")
             for vid in team.declared_vehicles:
                 self.vehicle(topic_team, vid)
             notices.append(f"{topic_team} declared run seq={request.seq} "
@@ -225,24 +242,82 @@ class FleetState:
         team = self.team(topic_team)
         team.last_command_seq = max(team.last_command_seq, command.seq)
         if command.WhichOneof("body") == "run_start":
-            rs = command.run_start
-            team.ended = False
-            team.run_id = rs.run_id
-            team.run_start_declaration_seq = rs.declaration_seq
-            if team.declaration_seq is None:
-                return [f"{topic_team} RunStart run_id={rs.run_id} (declaration not seen by "
-                        f"this host; declaration_seq={rs.declaration_seq})"]
-            if rs.declaration_seq != team.declaration_seq:
-                return [f"[WARN] {topic_team} RunStart declaration_seq={rs.declaration_seq} "
-                        f"does not match declaration seq={team.declaration_seq}"]
-            return [f"{topic_team} RunStart run_id={rs.run_id}"]
+            if self.is_applied_run_start(topic_team, command):
+                return []           # our own RunStart coming back: already applied on send
+            return self.apply_run_start(topic_team, command.seq, command.run_start)
         return []
+
+    def is_applied_run_start(self, team_id: str, command) -> bool:
+        """Is this RxCommand the RunStart already applied (our own, echoed back)?"""
+        team = self.teams.get(team_id)
+        if team is None or command.WhichOneof("body") != "run_start":
+            return False
+        rs = command.run_start
+        return (command.seq, rs.run_id, rs.declaration_seq) in team.run_start_keys
+
+    def apply_run_start(self, team_id: str, seq: int, rs) -> List[str]:
+        """A RunStart for the team: new run, clean map.
+
+        The console calls this as soon as its own RunStart is published, so the
+        map is cleared even if the broker's echo of it never arrives; the echo
+        (same seq) is then ignored instead of clearing a second time.
+        """
+        team = self.team(team_id)
+        team.run_start_keys.append((seq, rs.run_id, rs.declaration_seq))
+        team.last_command_seq = max(team.last_command_seq, seq)
+        self.clear_drawings(team_id)
+        team.ended = False
+        team.run_id = rs.run_id
+        team.run_start_declaration_seq = rs.declaration_seq
+        if team.declaration_seq is None:
+            return [f"{team_id} RunStart run_id={rs.run_id} (declaration not seen by "
+                    f"this host; declaration_seq={rs.declaration_seq})"]
+        if rs.declaration_seq != team.declaration_seq:
+            return [f"[WARN] {team_id} RunStart declaration_seq={rs.declaration_seq} "
+                    f"does not match declaration seq={team.declaration_seq}"]
+        return [f"{team_id} RunStart run_id={rs.run_id}"]
+
+    def start_blockers(self, team_id: str, now: Optional[float] = None) -> List[str]:
+        """Why the team's run can't start yet; empty when it can.
+
+        Every declared vehicle must be live (heartbeat within STALE_SECONDS)
+        and reporting STATE_AUTO.
+        """
+        now = time.time() if now is None else now
+        team = self.teams.get(team_id)
+        if team is None or not team.declared_vehicles:
+            return ["no vehicles declared"]
+        blockers = []
+        for vid in team.declared_vehicles:
+            v = self.vehicles.get((team_id, vid))
+            age = None if v is None else v.age(now)
+            if age is None:
+                blockers.append(f"{vid} no heartbeat")
+            elif age > STALE_SECONDS:
+                blockers.append(f"{vid} stale ({age:.1f} s)")
+            elif v.last_hb.state != common_pb2.STATE_AUTO:
+                blockers.append(f"{vid} {robot_state_name(v.last_hb.state)} (needs AUTO)")
+        return blockers
+
+    def clear_drawings(self, team_id: Optional[str] = None) -> None:
+        """Forget trails and Task 1 / Task 2 overlays (one team, or every team).
+
+        Run start does this for the team; the Map tab's Clear button for any.
+        Positions are kept, so live boats stay on the map.
+        """
+        for tid in ([team_id] if team_id is not None else list(self.teams)):
+            team = self.team(tid)
+            team.safe_passage = None
+            team.pipeline = None
+            for v in self.vehicles_of(tid):
+                v.trail.clear()
 
     def reset_counters(self, team_id: str) -> None:
         """Forget the team's command seq and last run id (host restarts numbering)."""
         team = self.teams.get(team_id)
         if team is not None:
             team.last_command_seq = 0
+            team.run_start_keys.clear()
             team.last_run_id = None
 
     def end_run(self, team_id: str) -> Optional[int]:

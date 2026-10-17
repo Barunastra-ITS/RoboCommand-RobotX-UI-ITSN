@@ -35,7 +35,7 @@ class CoursePanel(Panel):
         grid.setColumnStretch(1, 1)
         self.body.addLayout(grid)
 
-        self.validation_label = QLabel("Waiting for the retained RxCourse from RoboCommand.")
+        self.validation_label = QLabel("No course")
         self.validation_label.setObjectName("Faint")
         self.validation_label.setWordWrap(True)
         self.body.addWidget(self.validation_label)
@@ -86,5 +86,5 @@ class CoursePanel(Panel):
             self.validation_label.setStyleSheet(f"color: {theme.FAULT};")
         else:
             set_chip(self.valid_chip, "VALID", theme.OK)
-            self.validation_label.setText("Valid course configuration")
+            self.validation_label.setText("")
             self.validation_label.setStyleSheet(f"color: {theme.TEXT_FAINT};")

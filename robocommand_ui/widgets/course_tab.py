@@ -4,18 +4,24 @@ Replaces ``rc course --course-id … --corner-lats … --corner-lngs …``. The
 boundary ring is closed automatically on publish (first corner repeated at
 the end), so an open ring can't make the course INVALID.
 
-Corners can be typed in the table or pinned on the satellite map: enter a
-centre point, press Go, then click the map to drop each corner. The table
-and the pins stay in sync both ways.
+Three columns: **Presets** (pick one to load it; Add saves the fields as a
+new preset, Update overwrites the selected one), the **RxCourse** editor
+with the broker's retained course under it, and the **Boundary map**.
+Corners can be typed in the table or pinned on the map; the table and the
+pins stay in sync both ways, and the Centre fields follow the map as it is
+panned (or type a centre and press Go). The Course ID follows the course
+this host serves (from its address), so it is filled in already.
 """
 
+import time
 from pathlib import Path
 from typing import List, Optional, Tuple
 
 from PyQt5.QtCore import Qt, pyqtSignal
 from PyQt5.QtWidgets import (
-    QAbstractItemView, QComboBox, QFormLayout, QHBoxLayout, QHeaderView, QInputDialog,
-    QLabel, QLineEdit, QMessageBox, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
+    QAbstractItemView, QAbstractSpinBox, QFormLayout, QHBoxLayout, QHeaderView, QInputDialog,
+    QLabel, QLineEdit, QListWidget, QListWidgetItem, QMessageBox, QTableWidget, QTableWidgetItem,
+    QVBoxLayout, QWidget,
 )
 
 from robocommand_ui import theme
@@ -24,23 +30,44 @@ from robocommand_ui.course_presets import (
     CoursePreset, default_path, delete_preset, load_user_presets, merged, save_preset,
 )
 from robocommand_ui.course_validation import validate_course
+from robocommand_ui.courses import course_id_of
 from robocommand_ui.widgets.boundary_map import DEFAULT_ZOOM, BoundaryMap
 from robocommand_ui.widgets.form import button, caption, coord_spin, int_spin
 from robocommand_ui.widgets.panel import Panel, make_chip, set_chip
 
 LatLng = Tuple[float, float]
 MAX_PINGER_HZ = 200_000
-EDITOR_WIDTH = 470
+PRESETS_WIDTH = 250
+EDITOR_WIDTH = 440
+SAME_CORNER = 1e-7          # degrees: what the table's 7 decimals can tell apart
 
 
 def ring_center(corners) -> Optional[LatLng]:
     """Mean of the distinct corners, or None without any."""
-    pts = list(corners)
-    if len(pts) > 1 and pts[0] == pts[-1]:
-        pts = pts[:-1]
+    pts = open_ring(corners)
     if not pts:
         return None
     return (sum(c[0] for c in pts) / len(pts), sum(c[1] for c in pts) / len(pts))
+
+
+def open_ring(corners) -> List[LatLng]:
+    ring = [tuple(c) for c in corners]
+    if len(ring) > 1 and ring[0] == ring[-1]:
+        ring = ring[:-1]
+    return ring
+
+
+def same_ring(a, b) -> bool:
+    a, b = open_ring(a), open_ring(b)
+    return len(a) == len(b) and all(
+        abs(p[0] - q[0]) < SAME_CORNER and abs(p[1] - q[1]) < SAME_CORNER for p, q in zip(a, b))
+
+
+def sent_at_text(course) -> str:
+    """Local time of RxCourse.sent_at, or a note when the publisher left it unset."""
+    if not course.HasField("sent_at") or course.sent_at.seconds == 0:
+        return "(time unknown: no sent_at)"
+    return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(course.sent_at.seconds))
 
 
 class CourseTab(QWidget):
@@ -52,64 +79,100 @@ class CourseTab(QWidget):
         super().__init__(parent)
         self._presets_path = presets_path or default_path()
         self._presets = {}
+        self._active: Optional[str] = None      # preset loaded into the editor
         self._broker_course = None
+        self._rc_course = None                  # courses.Course this host serves
+        self._id_typed = False                  # operator typed their own Course ID
 
         row = QHBoxLayout(self)
         row.setContentsMargins(20, 16, 20, 16)
         row.setSpacing(16)
-        left = QWidget()
-        left.setFixedWidth(EDITOR_WIDTH)
-        col = QVBoxLayout(left)
+        presets = self._build_presets_panel()
+        presets.setFixedWidth(PRESETS_WIDTH)
+        row.addWidget(presets)
+        editor = QWidget()
+        editor.setFixedWidth(EDITOR_WIDTH)
+        col = QVBoxLayout(editor)
         col.setContentsMargins(0, 0, 0, 0)
         col.setSpacing(16)
         col.addWidget(self._build_editor(), 1)
         col.addWidget(self._build_broker_panel(), 0)
-        row.addWidget(left)
+        row.addWidget(editor)
         row.addWidget(self._build_map_panel(), 1)
 
         self._reload_presets()
-        first = next(iter(self._presets))
-        self.preset_combo.setCurrentText(first)
-        self._load_preset(first)
+        if self.preset_list.count():
+            self.preset_list.setCurrentRow(0)       # loads it
+        self.set_rc_course(None)
 
     # ---------- builders ----------
+    def _build_presets_panel(self) -> Panel:
+        panel = Panel("Presets")
+        self.preset_list = QListWidget()
+        self.preset_list.setCursor(Qt.PointingHandCursor)
+        self.preset_list.currentItemChanged.connect(self._on_preset_selected)
+        panel.body.addWidget(self.preset_list, 1)
+
+        self.preset_state = caption("")
+        panel.body.addWidget(self.preset_state)
+
+        self.add_preset_btn = button("+ Add preset", "Primary",
+                                     f"Save the fields as a new preset (asks for a name)\n"
+                                     f"in {self._presets_path}")
+        self.add_preset_btn.clicked.connect(self._add_preset)
+        panel.body.addWidget(self.add_preset_btn)
+        self.update_preset_btn = button("Update preset", tooltip="Overwrite the selected "
+                                        "preset with the fields (keeps its name)")
+        self.update_preset_btn.clicked.connect(self._update_preset)
+        panel.body.addWidget(self.update_preset_btn)
+        self.delete_btn = button("Delete preset", "Danger", "Delete the selected saved preset")
+        self.delete_btn.clicked.connect(self._delete_preset)
+        panel.body.addWidget(self.delete_btn)
+        return panel
+
     def _build_editor(self) -> Panel:
         panel = Panel("RxCourse parameters")
-
-        presets = QHBoxLayout()
-        presets.setSpacing(6)
-        self.preset_combo = QComboBox()
-        self.preset_combo.setCursor(Qt.PointingHandCursor)
-        self.preset_combo.setToolTip("Saved course parameters")
-        self.preset_combo.activated.connect(lambda _: self._load_preset(self.preset_combo.currentText()))
-        presets.addWidget(self.preset_combo, 1)
-        save_btn = button("Save as preset…",
-                          tooltip=f"Save the fields below under a name\n(in {self._presets_path})")
-        save_btn.clicked.connect(self._save_preset)
-        presets.addWidget(save_btn)
-        self.delete_btn = button("Delete", "Ghost", "Delete the selected saved preset")
-        self.delete_btn.clicked.connect(self._delete_preset)
-        presets.addWidget(self.delete_btn)
-        panel.body.addLayout(presets)
 
         form = QFormLayout()
         form.setLabelAlignment(Qt.AlignLeft | Qt.AlignVCenter)
         form.setHorizontalSpacing(12)
+        form.setVerticalSpacing(8)
+        id_col = QVBoxLayout()
+        id_col.setSpacing(4)
+        id_row = QHBoxLayout()
+        id_row.setSpacing(6)
         self.course_id = QLineEdit()
-        self.course_id.setFont(theme.mono_font(9.5))
+        self.course_id.setFont(theme.mono_font(10))
         self.course_id.setPlaceholderText("e.g. ALPHA")
-        form.addRow("Course ID", self.course_id)
+        id_row.addWidget(self.course_id, 1)
+        self.rc_course_btn = button("This host", "Ghost", "Fill in the course this host serves")
+        self.rc_course_btn.clicked.connect(self._use_rc_course)
+        id_row.addWidget(self.rc_course_btn)
+        id_col.addLayout(id_row)
+        self.rc_course_note = caption("")
+        id_col.addWidget(self.rc_course_note)
+        form.addRow("Course ID", id_col)
+
+        pinger_row = QHBoxLayout()
+        pinger_row.setSpacing(8)
         self.pinger = int_spin(1, MAX_PINGER_HZ, 25000)
-        self.pinger.setSuffix(" Hz")
-        form.addRow("Pinger frequency", self.pinger)
+        self.pinger.setButtonSymbols(QAbstractSpinBox.NoButtons)
+        self.pinger.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        self.pinger.setFont(theme.mono_font(10))
+        self.pinger.setToolTip(f"Pinger frequency in hertz (1 – {MAX_PINGER_HZ})")
+        pinger_row.addWidget(self.pinger, 1)
+        unit = QLabel("Hz")
+        unit.setObjectName("Unit")
+        pinger_row.addWidget(unit, 0, Qt.AlignVCenter)
+        form.addRow("Pinger frequency", pinger_row)
         panel.body.addLayout(form)
 
         self.corners = QTableWidget(0, 2)
         self.corners.setHorizontalHeaderLabels(["Latitude", "Longitude"])
         self.corners.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         self.corners.setSelectionBehavior(QAbstractItemView.SelectRows)
-        self.corners.setFont(theme.mono_font(9.5))
-        self.corners.setMinimumHeight(200)
+        self.corners.setFont(theme.mono_font(10))
+        self.corners.setMinimumHeight(180)
         panel.body.addWidget(self.corners, 1)
 
         edit_row = QHBoxLayout()
@@ -121,38 +184,34 @@ class CourseTab(QWidget):
         edit_row.addWidget(remove_btn)
         edit_row.addStretch()
         panel.body.addLayout(edit_row)
-        panel.body.addWidget(caption(
-            "Corners in order around the course. The first corner is repeated at the end "
-            "automatically when you publish."))
 
         self.validity = make_chip("", theme.IDLE)
         panel.body.addWidget(self.validity, 0, Qt.AlignLeft)
 
-        actions = QHBoxLayout()
         self.publish_btn = button("Publish course (retained)", "Primary",
                                   "Publish RxCourse on robocommand/robotx/course, retained")
         self.publish_btn.clicked.connect(self._publish)
-        actions.addWidget(self.publish_btn)
-        actions.addStretch()
-        panel.body.addLayout(actions)
+        panel.body.addWidget(self.publish_btn)
+        self.last_published = caption("")
+        panel.body.addWidget(self.last_published)
 
-        self.course_id.textChanged.connect(self._validate)
-        self.pinger.valueChanged.connect(self._validate)
-        self.corners.itemChanged.connect(self._validate)
+        self.course_id.textChanged.connect(self._on_fields_edited)
+        self.course_id.textEdited.connect(lambda _: setattr(self, "_id_typed", True))
+        self.pinger.valueChanged.connect(self._on_fields_edited)
+        self.corners.itemChanged.connect(self._on_fields_edited)
         return panel
 
     def _build_map_panel(self) -> Panel:
         panel = Panel("Boundary map", dot=theme.MAP_PIN)
-        panel.set_meta("click to pin corners")
         row = QHBoxLayout()
         row.setSpacing(8)
         label = QLabel("Centre")
         label.setObjectName("FormHeading")
         row.addWidget(label)
         self.center_lat = coord_spin(90.0)
-        self.center_lat.setToolTip("Centre latitude, decimal degrees")
+        self.center_lat.setToolTip("Centre latitude, decimal degrees (follows the map)")
         self.center_lng = coord_spin(180.0)
-        self.center_lng.setToolTip("Centre longitude, decimal degrees")
+        self.center_lng.setToolTip("Centre longitude, decimal degrees (follows the map)")
         row.addWidget(self.center_lat, 1)
         row.addWidget(self.center_lng, 1)
         go_btn = button("Go", "Primary", "Move the map to this centre point")
@@ -170,13 +229,13 @@ class CourseTab(QWidget):
 
         self.map = BoundaryMap()
         self.map.corners_changed.connect(self._on_map_corners)
+        self.map.view_changed.connect(self._on_map_moved)
         panel.body.addWidget(self.map, 1)
         return panel
 
     def _build_broker_panel(self) -> Panel:
         panel = Panel("On the broker now")
-        panel.set_meta("robocommand/robotx/course · retained")
-        self.broker_summary = caption("Nothing received yet. Connect to the broker first.")
+        self.broker_summary = caption("—")
         self.broker_summary.setFont(theme.mono_font(9.5))
         self.broker_summary.setTextInteractionFlags(Qt.TextSelectableByMouse)
         panel.body.addWidget(self.broker_summary)
@@ -191,10 +250,45 @@ class CourseTab(QWidget):
         row.addWidget(clear_btn)
         row.addStretch()
         panel.body.addLayout(row)
-        panel.body.addStretch()
         return panel
 
+    # ---------- course of this host ----------
+    def set_rc_course(self, course) -> None:
+        """The course this RoboCommand host serves (courses.Course, or None).
+
+        Fills the Course ID unless the operator typed their own.
+        """
+        follows = not self._id_typed or not self.course_id.text().strip()
+        self._rc_course = course
+        self.rc_course_btn.setEnabled(course is not None)
+        if course is None:
+            self.rc_course_note.setText("")
+            return
+        where = f" · {course.host}" if course.host else ""
+        self.rc_course_note.setText(f"{course.name}{where}")
+        if follows:
+            self._use_rc_course()
+
+    def rc_course_id(self) -> Optional[str]:
+        return course_id_of(self._rc_course) if self._rc_course is not None else None
+
+    def _use_rc_course(self) -> None:
+        course_id = self.rc_course_id()
+        if course_id:
+            self._id_typed = False
+            self.course_id.setText(course_id)
+
     # ---------- presets ----------
+    def selected_preset(self) -> Optional[str]:
+        item = self.preset_list.currentItem()
+        return item.data(Qt.UserRole) if item is not None else None
+
+    def select_preset(self, name: str) -> None:
+        for i in range(self.preset_list.count()):
+            if self.preset_list.item(i).data(Qt.UserRole) == name:
+                self.preset_list.setCurrentRow(i)
+                return
+
     def _reload_presets(self) -> None:
         try:
             user = load_user_presets(self._presets_path)
@@ -202,51 +296,101 @@ class CourseTab(QWidget):
             self.log.emit(f"[ERROR] {e}")
             user = []
         self._presets = merged(user)
-        current = self.preset_combo.currentText()
-        self.preset_combo.blockSignals(True)
-        self.preset_combo.clear()
-        self.preset_combo.addItems(list(self._presets))
-        if current in self._presets:
-            self.preset_combo.setCurrentText(current)
-        self.preset_combo.blockSignals(False)
-        self._sync_delete()
+        current = self.selected_preset()
+        self.preset_list.blockSignals(True)
+        self.preset_list.clear()
+        for name, preset in self._presets.items():
+            item = QListWidgetItem(name)
+            item.setData(Qt.UserRole, name)
+            item.setToolTip(f"{preset.course_id} · {preset.pinger_freq_hz} Hz · "
+                            f"{len(open_ring(preset.corners))} corners"
+                            + (" · built-in" if preset.builtin else ""))
+            self.preset_list.addItem(item)
+            if name == current:
+                self.preset_list.setCurrentItem(item)
+        self.preset_list.blockSignals(False)
+        self._sync_preset_buttons()
 
-    def _sync_delete(self) -> None:
-        preset = self._presets.get(self.preset_combo.currentText())
-        self.delete_btn.setEnabled(preset is not None and not preset.builtin)
+    def _on_preset_selected(self, item, _previous=None) -> None:
+        if item is not None:
+            self._load_preset(item.data(Qt.UserRole))
 
     def _load_preset(self, name: str) -> None:
         preset = self._presets.get(name)
-        self._sync_delete()
-        if preset is not None:
-            self.set_fields(preset.course_id, preset.pinger_freq_hz, preset.corners)
-            self._center_on_corners()
+        if preset is None:
+            return
+        self._active = name
+        self.set_fields(self.rc_course_id() or preset.course_id, preset.pinger_freq_hz,
+                        preset.corners)
+        self._center_on_corners()
+        self._sync_preset_buttons()
 
-    def _save_preset(self) -> None:
+    def _preset_modified(self) -> bool:
+        """Do the fields differ from the preset they were loaded from?"""
+        preset = self._presets.get(self._active or "")
+        if preset is None:
+            return False
+        corners, error = self.read_corners()
+        course_id = self.course_id.text().strip()
+        return bool(error) or not (
+            course_id in (preset.course_id, self.rc_course_id())    # auto-filled ID isn't an edit
+            and self.pinger.value() == preset.pinger_freq_hz
+            and same_ring(corners, preset.corners))
+
+    def _sync_preset_buttons(self) -> None:
+        preset = self._presets.get(self._active or "")
+        modified = self._preset_modified()
+        self.update_preset_btn.setEnabled(preset is not None and modified)
+        self.delete_btn.setEnabled(preset is not None and not preset.builtin)
+        self.preset_state.setText("Unsaved changes" if modified else "")
+        self.preset_state.setVisible(modified)
+
+    def _preset_from_fields(self, name: str) -> Optional[CoursePreset]:
         corners, error = self.read_corners()
         if error:
             QMessageBox.warning(self, "Cannot save preset", error)
-            return
-        name, ok = QInputDialog.getText(self, "Save course preset", "Preset name:",
-                                        text=self.course_id.text().strip())
-        name = name.strip()
-        if not ok or not name:
-            return
-        preset = CoursePreset(name, self.course_id.text().strip(), self.pinger.value(),
-                              tuple(close_ring(corners)))
+            return None
+        return CoursePreset(name, self.course_id.text().strip(), self.pinger.value(),
+                            tuple(close_ring(corners)))
+
+    def _write_preset(self, preset: CoursePreset, verb: str) -> None:
         try:
             save_preset(self._presets_path, preset)
         except (OSError, ValueError) as e:
             QMessageBox.warning(self, "Cannot save preset", str(e))
             return
+        self._active = preset.name
         self._reload_presets()
-        self.preset_combo.setCurrentText(name)
-        self._sync_delete()
-        self.log.emit(f"Saved course preset '{name}'")
+        self.preset_list.blockSignals(True)        # fields are the preset already
+        self.select_preset(preset.name)
+        self.preset_list.blockSignals(False)
+        self._sync_preset_buttons()
+        self.log.emit(f"{verb} course preset '{preset.name}'")
+
+    def _add_preset(self) -> None:
+        name, ok = QInputDialog.getText(self, "Add course preset", "Name of the new preset:")
+        name = name.strip()
+        if not ok or not name:
+            return
+        if name in self._presets and QMessageBox.question(
+                self, "Replace preset?", f"A preset named '{name}' exists. Replace it?") \
+                != QMessageBox.Yes:
+            return
+        preset = self._preset_from_fields(name)
+        if preset is not None:
+            self._write_preset(preset, "Saved")
+
+    def _update_preset(self) -> None:
+        name = self._active
+        if name not in self._presets:
+            return
+        preset = self._preset_from_fields(name)
+        if preset is not None:
+            self._write_preset(preset, "Updated")
 
     def _delete_preset(self) -> None:
-        name = self.preset_combo.currentText()
-        preset = self._presets.get(name)
+        name = self._active
+        preset = self._presets.get(name or "")
         if preset is None or preset.builtin:
             return
         if QMessageBox.question(self, "Delete preset", f"Delete the preset '{name}'?") != QMessageBox.Yes:
@@ -256,38 +400,54 @@ class CourseTab(QWidget):
         except (OSError, ValueError) as e:
             QMessageBox.warning(self, "Cannot delete preset", str(e))
             return
+        self._active = None
         self._reload_presets()
-        self._load_preset(self.preset_combo.currentText())
+        if name in self._presets:           # the built-in it had replaced is back
+            self.select_preset(name)
+            self._load_preset(name)
+        self._sync_preset_buttons()
         self.log.emit(f"Deleted course preset '{name}'")
 
     # ---------- fields ----------
     def set_fields(self, course_id: str, pinger_hz: int, corners) -> None:
+        self.course_id.blockSignals(True)
         self.course_id.setText(course_id)
+        self.course_id.blockSignals(False)
+        self.pinger.blockSignals(True)
         self.pinger.setValue(pinger_hz)
-        ring = list(corners)
-        if len(ring) > 1 and ring[0] == ring[-1]:
-            ring = ring[:-1]                # shown open; closed again on publish
+        self.pinger.blockSignals(False)
         self.corners.blockSignals(True)
         self.corners.setRowCount(0)
-        for lat, lng in ring:
+        for lat, lng in open_ring(corners):      # shown open; closed again on publish
             self._append_row(f"{lat:.7f}", f"{lng:.7f}")
         self.corners.blockSignals(False)
+        self._on_fields_edited()
+
+    def _on_fields_edited(self, *_args) -> None:
         self._validate()
+        self._sync_preset_buttons()
 
     # ---------- map ----------
     def _go_to_center(self) -> None:
         zoom = self.map.zoom() if self.map.corners() else DEFAULT_ZOOM
         self.map.set_center(self.center_lat.value(), self.center_lng.value(), zoom)
 
+    def _on_map_moved(self, lat: float, lng: float) -> None:
+        """The map was panned or zoomed: the Centre fields follow it."""
+        for spin, value in ((self.center_lat, lat), (self.center_lng, lng)):
+            if spin.hasFocus():
+                continue                    # don't overwrite what the operator is typing
+            spin.blockSignals(True)
+            spin.setValue(value)
+            spin.blockSignals(False)
+
     def _center_on_corners(self) -> None:
         corners, error = self.read_corners()
         center = ring_center(corners) if not error else None
         if center is None:
             return
-        self.center_lat.setValue(center[0])
-        self.center_lng.setValue(center[1])
         self.map.set_center(*center)
-        self.map.fit_corners()
+        self.map.fit_corners()              # the Centre fields follow via view_changed
 
     def _on_map_corners(self, corners) -> None:
         """Pins moved on the map: rewrite the table from them."""
@@ -297,10 +457,11 @@ class CourseTab(QWidget):
             self._append_row(f"{lat:.7f}", f"{lng:.7f}")
         self.corners.blockSignals(False)
         self._validate(sync_map=False)
+        self._sync_preset_buttons()
 
     def _clear_corners(self) -> None:
         self.corners.setRowCount(0)
-        self._validate()
+        self._on_fields_edited()
 
     def _append_row(self, lat: str = "", lng: str = "", at: Optional[int] = None) -> None:
         row = self.corners.rowCount() if at is None else at
@@ -313,13 +474,13 @@ class CourseTab(QWidget):
         self.corners.blockSignals(True)
         self._append_row(at=None if current < 0 else current + 1)
         self.corners.blockSignals(False)
-        self._validate()
+        self._on_fields_edited()
 
     def _remove_corner(self) -> None:
         current = self.corners.currentRow()
         if current >= 0:
             self.corners.removeRow(current)
-            self._validate()
+            self._on_fields_edited()
 
     def read_corners(self) -> Tuple[List[LatLng], str]:
         """Corners from the table, or an error naming the first bad cell."""
@@ -369,18 +530,23 @@ class CourseTab(QWidget):
                 "A GCS that connects afterwards will not get a course.") == QMessageBox.Yes:
             self.clear_requested.emit()
 
+    def mark_published(self, course) -> None:
+        """This console's publish went out: show when, from the course's own sent_at."""
+        self.last_published.setText(
+            f"Last published {sent_at_text(course)} · {course.course_id or '<empty>'}")
+
     # ---------- broker state ----------
     def show_broker_course(self, course) -> None:
         self._broker_course = course
         self.copy_btn.setEnabled(course is not None)
         if course is None:
-            self.broker_summary.setText("No retained course on the broker.")
+            self.broker_summary.setText("None")
             return
         issues = validate_course(course)
         state = "VALID" if not issues else "INVALID: " + "; ".join(issues)
         self.broker_summary.setText(
             f"{course.course_id or '<empty>'} · {course.pinger_freq_hz} Hz · "
-            f"{len(course.corners)} corners · {state}")
+            f"{len(course.corners)} corners · {state}\npublished {sent_at_text(course)}")
         self.broker_summary.setToolTip("\n".join(
             f"{i + 1:>2}  {c.latitude:.7f}, {c.longitude:.7f}"
             for i, c in enumerate(course.corners)))
@@ -388,6 +554,11 @@ class CourseTab(QWidget):
     def _copy_broker_course(self) -> None:
         c = self._broker_course
         if c is not None:
+            self._active = None             # not a preset any more
+            self.preset_list.blockSignals(True)
+            self.preset_list.clearSelection()
+            self.preset_list.setCurrentItem(None)
+            self.preset_list.blockSignals(False)
             self.set_fields(c.course_id, c.pinger_freq_hz,
                             [(p.latitude, p.longitude) for p in c.corners])
             self._center_on_corners()

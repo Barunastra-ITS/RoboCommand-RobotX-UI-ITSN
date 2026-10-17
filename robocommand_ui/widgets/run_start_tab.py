@@ -4,28 +4,39 @@ Replaces ``rc run-start --team … --declaration-seq … --run-id …``. Each te
 whose GCS sent a RunDeclaration is listed; pick one and press **Allow start**.
 The declaration seq comes from the declaration itself, so it always matches.
 
+Allow start stays disabled until every declared vehicle is live (fresh
+heartbeat) and in AUTO; what is missing is listed under the team.
+
 **End run** closes an ACTIVE run on this host (the protocol has no run-end
 message): the run log is saved and the team shows ENDED until its GCS sends
 a new RunDeclaration, which then appears here as DECLARED.
+
+**Finished runs** lists every saved run by Run ID; pick one to replay its map
+and vehicle movement.
 """
 
 import time
-from typing import List, Optional
+from pathlib import Path
+from typing import Dict, List, Optional
 
 from PyQt5.QtCore import Qt, pyqtSignal
 from PyQt5.QtWidgets import (
-    QAbstractItemView, QFormLayout, QHBoxLayout, QHeaderView, QLabel, QTableWidget,
-    QTableWidgetItem, QWidget,
+    QAbstractItemView, QFormLayout, QHBoxLayout, QHeaderView, QLabel, QMessageBox, QTableWidget,
+    QTableWidgetItem, QVBoxLayout, QWidget,
 )
 
 from robocommand_ui import theme
-from robocommand_ui.fleet_state import STALE_SECONDS, FleetState, TeamState
+from robocommand_ui.fleet_state import FleetState, TeamState
 from robocommand_ui.proto_helper import task_tier_name
+from robocommand_ui.run_log import format_duration
+from robocommand_ui.run_replay import RunSummary, list_runs, load_run
 from robocommand_ui.widgets.form import button, caption, int_spin
 from robocommand_ui.widgets.panel import Panel
+from robocommand_ui.widgets.run_replay_dialog import RunReplayDialog
 from robocommand_ui.widgets.teams_panel import RUN_COLORS
 
-COLUMNS = ["Team", "State", "Decl seq", "Vehicles", "Live", "Tiers T1–T4", "Run ID"]
+COLUMNS = ["Team", "State", "Decl seq", "Vehicles", "Live+Auto", "Tiers T1–T4", "Run ID"]
+RUN_COLUMNS = ["Run ID", "Team", "Started", "Duration", "Ended"]
 STATE_ORDER = {"DECLARED": 0, "DECL MISMATCH": 1, "ACTIVE": 2, "ENDED": 3}
 NEW_RUN_HINT = ("Waiting for the team's new RunDeclaration. nala2-report GCS: "
                 "ros2 service call /nala2_report/new_run std_srvs/srv/Trigger")
@@ -44,44 +55,71 @@ class RunStartTab(QWidget):
     end_requested = pyqtSignal(str)                 # team_id
     reset_requested = pyqtSignal(str)               # team_id
 
-    def __init__(self, parent=None):
+    def __init__(self, run_log_dir: Optional[Path] = None, parent=None):
         super().__init__(parent)
         self._teams = {}
+        self._blockers: Dict[str, List[str]] = {}
         self._connected = False
         self._run_id_for = None         # (team, declaration seq) the run id was suggested for
+        self._run_log_dir = run_log_dir
+        self._runs: List[RunSummary] = []
 
         row = QHBoxLayout(self)
         row.setContentsMargins(20, 16, 20, 16)
         row.setSpacing(16)
-        row.addWidget(self._build_list(), 3)
+        left = QVBoxLayout()
+        left.setSpacing(16)
+        left.addWidget(self._build_list(), 3)
+        left.addWidget(self._build_runs(), 2)
+        row.addLayout(left, 3)
         row.addWidget(self._build_action(), 2)
         self._sync_action()
+        self.reload_runs()
 
-    def _build_list(self) -> Panel:
-        panel = Panel("Run start requests")
-        self.table = QTableWidget(0, len(COLUMNS))
-        self.table.setHorizontalHeaderLabels(COLUMNS)
-        header = self.table.horizontalHeader()
+    @staticmethod
+    def _table(columns: List[str]) -> QTableWidget:
+        table = QTableWidget(0, len(columns))
+        table.setHorizontalHeaderLabels(columns)
+        header = table.horizontalHeader()
         header.setSectionResizeMode(QHeaderView.ResizeToContents)
         header.setStretchLastSection(True)
         header.setDefaultAlignment(Qt.AlignLeft | Qt.AlignVCenter)
-        self.table.verticalHeader().setVisible(False)
-        self.table.setEditTriggers(QTableWidget.NoEditTriggers)
-        self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
-        self.table.setSelectionMode(QAbstractItemView.SingleSelection)
-        self.table.setShowGrid(False)
+        table.verticalHeader().setVisible(False)
+        table.setEditTriggers(QTableWidget.NoEditTriggers)
+        table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        table.setSelectionMode(QAbstractItemView.SingleSelection)
+        table.setShowGrid(False)
+        return table
+
+    def _build_list(self) -> Panel:
+        panel = Panel("Run start requests")
+        self.table = self._table(COLUMNS)
         self.table.itemSelectionChanged.connect(self._sync_action)
         panel.body.addWidget(self.table, 1)
-        self.empty = QLabel("No team has declared a run yet.\n"
-                            "A team appears here when its GCS sends a RunDeclaration.")
+        self.empty = QLabel("No run requests")
         self.empty.setObjectName("Empty")
         self.empty.setAlignment(Qt.AlignCenter)
         panel.body.addWidget(self.empty, 1)
         return panel
 
+    def _build_runs(self) -> Panel:
+        panel = Panel("Finished runs")
+        self.replay_btn = button("Replay", "Ghost", "Replay the selected run's map and movement")
+        self.replay_btn.clicked.connect(self._on_replay)
+        panel.actions.addWidget(self.replay_btn)
+        self.runs_table = self._table(RUN_COLUMNS)
+        self.runs_table.itemSelectionChanged.connect(self._sync_replay)
+        self.runs_table.cellDoubleClicked.connect(lambda *_: self._on_replay())
+        panel.body.addWidget(self.runs_table, 1)
+        self.runs_empty = QLabel("No finished runs")
+        self.runs_empty.setObjectName("Empty")
+        self.runs_empty.setAlignment(Qt.AlignCenter)
+        panel.body.addWidget(self.runs_empty, 1)
+        return panel
+
     def _build_action(self) -> Panel:
         panel = Panel("Allow start")
-        self.selected_label = QLabel("Select a team from the list")
+        self.selected_label = QLabel("No team selected")
         self.selected_label.setObjectName("FormHeading")
         panel.body.addWidget(self.selected_label)
         self.detail = caption("")
@@ -104,17 +142,11 @@ class RunStartTab(QWidget):
                               "for the team's next RunDeclaration")
         self.end_btn.clicked.connect(self._on_end)
         panel.body.addWidget(self.end_btn)
-        panel.body.addWidget(caption(
-            "Check before starting: vehicles LIVE, tiers as briefed, and the UAV geofence "
-            "inside the course on the Map tab."))
         panel.body.addStretch()
         self.reset_btn = button("Reset run ID && seq", "Ghost",
                                 "Suggest Run ID 1 and restart this team's command seq at 1")
         self.reset_btn.clicked.connect(self._on_reset)
         panel.body.addWidget(self.reset_btn)
-        panel.body.addWidget(caption(
-            "Only between runs (DECLARED or ENDED): the GCS drops a repeated seq as a duplicate "
-            "until the team declares a new run."))
         return panel
 
     # ---------- state ----------
@@ -140,18 +172,20 @@ class RunStartTab(QWidget):
         selected = self.selected_team()
         teams = requesting_teams(fleet)
         self._teams = {t.team_id: t for t in teams}
+        self._blockers = {t.team_id: fleet.start_blockers(t.team_id, now) for t in teams}
 
         self.table.blockSignals(True)
         self.table.setRowCount(len(teams))
         for row, team in enumerate(teams):
-            tracks = fleet.vehicles_of(team.team_id)
-            live = sum(1 for v in tracks if v.age(now) is not None and v.age(now) <= STALE_SECONDS)
+            declared = len(team.declared_vehicles)
+            ready = declared - sum(1 for b in self._blockers[team.team_id]
+                                   if b != "no vehicles declared")
             values = [
                 team.team_id,
                 team.run_state,
                 "—" if team.declaration_seq is None else str(team.declaration_seq),
                 ", ".join(team.declared_vehicles) or "—",
-                f"{live}/{len(team.declared_vehicles) or len(tracks)}",
+                f"{ready}/{declared}",
                 " ".join(task_tier_name(t)[:3] for t in team.tiers),
                 "—" if team.run_id is None else str(team.run_id),
             ]
@@ -160,6 +194,9 @@ class RunStartTab(QWidget):
                 item.setFont(theme.ui_font(10, 700) if col in (0, 1) else theme.mono_font(9.5))
                 if col == 1:
                     item.setForeground(theme.qcolor(RUN_COLORS.get(text, theme.TEXT)))
+                if col == 4:
+                    item.setForeground(theme.qcolor(
+                        theme.OK if declared and ready == declared else theme.WARN))
                 self.table.setItem(row, col, item)
         self.table.clearSelection()
         if selected in self._teams:
@@ -196,13 +233,63 @@ class RunStartTab(QWidget):
             self.start_btn.setText("Allow start")
             self.start_btn.setEnabled(False)
             return
+        blockers = self._blockers.get(team_id, [])
         self.selected_label.setText(f"{team_id} · {state}")
         self.detail.setText(
             f"Declaration seq {team.declaration_seq}  ·  vehicles "
             f"{', '.join(team.declared_vehicles) or '—'}"
+            + (f"\nNot ready: {'; '.join(blockers)}" if blockers
+               else "\nAll vehicles LIVE and AUTO.")
             + ("" if self._connected else "\nConnect to the broker to send."))
         self.start_btn.setText("Restart run" if state == "ACTIVE" else "Allow start")
-        self.start_btn.setEnabled(self._connected and team.declaration_seq is not None)
+        self.start_btn.setEnabled(self._connected and team.declaration_seq is not None
+                                  and not blockers)
+
+    # ---------- finished runs ----------
+    def reload_runs(self) -> None:
+        """Re-read the run log directory (call after a run log is saved)."""
+        selected = self._selected_run()
+        self._runs = list_runs(self._run_log_dir)
+        self.runs_table.blockSignals(True)
+        self.runs_table.setRowCount(len(self._runs))
+        for row, run in enumerate(self._runs):
+            values = [
+                str(run.run_id),
+                run.team_id,
+                time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(run.started_at)),
+                format_duration(run.duration),
+                run.reason,
+            ]
+            for col, text in enumerate(values):
+                item = QTableWidgetItem(text)
+                item.setFont(theme.ui_font(10, 700) if col in (0, 1) else theme.mono_font(9.5))
+                self.runs_table.setItem(row, col, item)
+        self.runs_table.clearSelection()
+        if selected is not None and selected in self._runs:
+            self.runs_table.selectRow(self._runs.index(selected))
+        self.runs_table.blockSignals(False)
+        self.runs_table.setVisible(bool(self._runs))
+        self.runs_empty.setVisible(not self._runs)
+        self._sync_replay()
+
+    def _selected_run(self) -> Optional[RunSummary]:
+        rows = self.runs_table.selectionModel().selectedRows()
+        return self._runs[rows[0].row()] if rows and rows[0].row() < len(self._runs) else None
+
+    def _sync_replay(self) -> None:
+        self.replay_btn.setEnabled(self._selected_run() is not None)
+
+    def _on_replay(self) -> None:
+        run = self._selected_run()
+        if run is None:
+            return
+        try:
+            replay = load_run(run.replay_path)
+        except (OSError, ValueError, KeyError, TypeError, IndexError) as err:
+            QMessageBox.warning(self, "Replay unavailable",
+                                f"Could not read {run.replay_path.name}: {err}")
+            return
+        RunReplayDialog(run, replay, self).exec_()
 
     def _on_reset(self) -> None:
         team_id = self.selected_team()

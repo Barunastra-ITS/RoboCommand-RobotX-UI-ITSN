@@ -1,0 +1,10 @@
+#!/bin/sh
+# NetworkManager dispatcher hook (installed by scripts/dhcp/install_dhcp.sh).
+# dhcpd picks its subnet from the interface address only when it starts, so
+# restart it whenever the course interface comes up or its address changes.
+IFACE="__IFACE__"
+[ "$1" = "$IFACE" ] || exit 0
+case "$2" in
+    up|dhcp4-change|reapply) systemctl restart isc-dhcp-server ;;
+    down) systemctl stop isc-dhcp-server ;;
+esac

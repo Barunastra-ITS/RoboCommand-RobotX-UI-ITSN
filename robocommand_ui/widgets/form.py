@@ -142,11 +142,11 @@ class LatLngField(QWidget):
     def _check(self) -> None:
         inside = self.is_inside_course()
         if inside is None:
-            self.hint.setText("No course yet: positions are not checked")
+            self.hint.setText("")
             self.hint.setStyleSheet(f"color: {theme.TEXT_FAINT};")
         elif inside:
             self.hint.setText("Inside the course")
             self.hint.setStyleSheet(f"color: {theme.OK};")
         else:
-            self.hint.setText("Outside the course boundary")
+            self.hint.setText("Outside the course")
             self.hint.setStyleSheet(f"color: {theme.WARN};")

@@ -76,7 +76,7 @@ class Readout(QWidget):
 
     def set(self, text: str, color: str = theme.TEXT) -> None:
         self.value.setText(text)
-        self.value.setStyleSheet(f"color: {color};")
+        self.value.setStyleSheet(f"color: {theme.resolve(color)};")
 
 
 class MonitorCard(QFrame):
@@ -131,12 +131,12 @@ class MonitorCard(QFrame):
     def _set_edge(self, color: str) -> None:
         self.setStyleSheet(
             f"QFrame#Card {{ background: {theme.SURFACE_2}; border: 1px solid {theme.BORDER};"
-            f" border-left: 3px solid {color}; border-radius: {theme.RADIUS_SM}px; }}")
+            f" border-left: 3px solid {theme.resolve(color)}; border-radius: {theme.RADIUS_SM}px; }}")
 
     def _set(self, name: str, text: str, color: str = theme.TEXT) -> None:
         label = self._values[name]
         label.setText(text)
-        label.setStyleSheet(f"color: {color};")
+        label.setStyleSheet(f"color: {theme.resolve(color)};")
 
     def show_track(self, v: VehicleTrack, now: float) -> None:
         status, color = activity(v.age(now))
@@ -184,7 +184,7 @@ class VehicleMonitorPanel(Panel):
     def __init__(self, parent=None):
         super().__init__("Vehicles", parent)
         self._cards: Dict[Tuple[str, str], MonitorCard] = {}
-        self._empty = QLabel("No vehicles reporting yet.\nThey appear as soon as a GCS sends a heartbeat.")
+        self._empty = QLabel("No vehicles")
         self._empty.setObjectName("Empty")
         self._empty.setAlignment(Qt.AlignCenter)
         self.body.addWidget(self._empty)

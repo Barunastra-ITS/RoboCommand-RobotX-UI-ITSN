@@ -125,7 +125,7 @@ class MqttWorker(QThread):
             return
         self._is_connected = True
         topic = f"{TOPIC_ROOT}/#"
-        client.subscribe(topic)
+        client.subscribe(topic, qos=1)      # QoS 1: a RunStart or report isn't silently dropped
         self.log_message.emit(f"Connected to {self.broker}. Monitoring {topic}")
         self.connected.emit()
 

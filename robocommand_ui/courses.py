@@ -33,6 +33,40 @@ COURSES: Dict[str, Course] = {
 }
 
 
+# Team Village demo network (VLAN 70), served by this host's DHCP
+# (scripts/dhcp/dhcpd.conf). Only used to name the course this host serves.
+DEMO_NETWORK = "192.168.70.0/24"
+
+
+def course_id_of(course: Course) -> str:
+    """RxCourse.course_id for a course: ALPHA, BRAVO, CHARLIE, DELTA, DEMO."""
+    return course.key.upper()
+
+
+def host_course(broker_host: str = "",
+                addresses: Optional[List[Tuple[str, str]]] = None) -> Optional[Course]:
+    """The course this RoboCommand host serves, from its own addresses.
+
+    The broker address wins when it is a course host (watching a course
+    from another machine); otherwise this machine's interface addresses
+    (the host is ``.2`` on the course network). None off the course networks.
+    """
+    course = course_for_address(broker_host) if broker_host else None
+    if course is not None:
+        return course
+    addresses = local_ipv4_addresses() if addresses is None else addresses
+    for _, addr in addresses:
+        course = course_for_address(addr)
+        if course is not None:
+            return course
+        try:
+            if ipaddress.ip_address(addr) in ipaddress.ip_network(DEMO_NETWORK):
+                return COURSES["demo"]
+        except ValueError:
+            continue
+    return None
+
+
 def resolve_host(course_key: str, host_override: Optional[str] = None) -> str:
     """Return the RoboCommand broker address for a course.
 

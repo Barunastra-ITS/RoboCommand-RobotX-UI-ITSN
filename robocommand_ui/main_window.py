@@ -14,14 +14,15 @@ Nothing is published unless the operator presses a send button.
 
 import time
 
-from PyQt5.QtCore import Qt, QTimer
+from PyQt5.QtCore import QSettings, Qt, QTimer
 from PyQt5.QtWidgets import (
-    QApplication, QComboBox, QFrame, QHBoxLayout, QLabel, QMainWindow, QMessageBox,
+    QApplication, QComboBox, QFrame, QHBoxLayout, QLabel, QMainWindow, QMessageBox, QPushButton,
     QScrollArea, QSplitter, QTabWidget, QVBoxLayout, QWidget,
 )
 
 from robocommand_ui import commands, theme
 from robocommand_ui.course_validation import validate_course
+from robocommand_ui.courses import host_course
 from robocommand_ui.fleet_state import STALE_SECONDS, FleetState
 from robocommand_ui.proto_helper import task_tier_name
 from robocommand_ui.incident_log import IncidentLog
@@ -41,6 +42,7 @@ from robocommand_ui.widgets.vehicle_monitor import VehicleMonitorPanel
 ALL_TEAMS = "All teams"
 REFRESH_MS = 500            # matches the 2 Hz heartbeat rate
 RAIL_WIDTH = 440
+THEME_KEY = "theme"
 
 
 def course_center(ring):
@@ -52,11 +54,14 @@ def course_center(ring):
 
 
 class MainWindow(QMainWindow):
-    def __init__(self, presets_path=None, run_log_dir=None):
+    def __init__(self, presets_path=None, run_log_dir=None, settings=None):
         super().__init__()
-        self.setWindowTitle("RoboCommand Host Console — RobotX 2026")
+        self.setWindowTitle("RoboCommand")
         self.setMinimumSize(1280, 780)
         self.resize(1560, 960)
+        self._settings = settings if settings is not None else QSettings("RoboCommand", "HostConsole")
+        saved = str(self._settings.value(THEME_KEY, theme.DEFAULT_MODE))
+        theme.set_mode(saved if saved in theme.PALETTES else theme.DEFAULT_MODE)
         app = QApplication.instance()
         if app is not None:
             theme.apply(app)
@@ -68,6 +73,7 @@ class MainWindow(QMainWindow):
         self.sender = commands.CommandSender(self._publish, self._seen_command_seq)
         self._presets_path = presets_path
         self.recorder = RunRecorder(run_log_dir)
+        self._course = None             # (ring, course_id) of the retained RxCourse
 
         root = QWidget()
         root.setObjectName("Root")
@@ -78,8 +84,9 @@ class MainWindow(QMainWindow):
         layout.addWidget(self._build_header())
         layout.addWidget(self._build_tabs(), 1)
 
-        self.statusBar().showMessage("Ready. Choose the broker and press Connect.")
+        self.statusBar().showMessage("Ready")
         self._connect_signals()
+        self.course_tab.set_rc_course(host_course())
 
         self._refresh_timer = QTimer(self)
         self._refresh_timer.timeout.connect(self.refresh_views)
@@ -95,12 +102,9 @@ class MainWindow(QMainWindow):
 
         brand = QVBoxLayout()
         brand.setSpacing(2)
-        title = QLabel("RoboCommand host console")
+        title = QLabel("RoboCommand")
         title.setObjectName("Brand")
-        sub = QLabel("Course host · RoboCommand ⇄ OCS · RobotX 2026 §3.4")
-        sub.setObjectName("BrandSub")
         brand.addWidget(title)
-        brand.addWidget(sub)
         row.addLayout(brand)
         row.addSpacing(14)
 
@@ -125,7 +129,7 @@ class MainWindow(QMainWindow):
 
         divider = QFrame()
         divider.setFixedSize(1, 24)
-        divider.setStyleSheet(f"background: {theme.BORDER};")
+        divider.setObjectName("Divider")
         row.addWidget(divider)
 
         self.connection_bar = ConnectionBar()
@@ -145,6 +149,19 @@ class MainWindow(QMainWindow):
         row.addLayout(clock)
         self._tick_clock()
         return header
+
+    def _label_theme_btn(self):
+        dark = theme.mode() == theme.DARK
+        self.theme_btn.setText("Light mode" if dark else "Dark mode")
+
+    def _toggle_theme(self):
+        theme.set_mode(theme.LIGHT if theme.mode() == theme.DARK else theme.DARK)
+        self._settings.setValue(THEME_KEY, theme.mode())
+        app = QApplication.instance()
+        if app is not None:
+            theme.apply(app)
+        self._label_theme_btn()
+        self.refresh_views()
 
     def _tick_clock(self):
         now = time.localtime()
@@ -201,10 +218,23 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(self._build_body(), "MAP")
         self.course_tab = CourseTab(self._presets_path)
         self.tabs.addTab(self.course_tab, "COURSE")
-        self.run_start_tab = RunStartTab()
+        self.run_start_tab = RunStartTab(self.recorder.directory)
         self.tabs.addTab(self.run_start_tab, "RUN START")
         self.task4_tab = Task4Tab()
         self.tabs.addTab(self.task4_tab, "TASK 4")
+
+        corner = QWidget()
+        corner.setObjectName("TabCorner")       # same surface as the tab bar
+        corner_row = QHBoxLayout(corner)
+        corner_row.setContentsMargins(0, 4, 20, 4)
+        self.theme_btn = QPushButton()
+        self.theme_btn.setObjectName("Ghost")
+        self.theme_btn.setCursor(Qt.PointingHandCursor)
+        self.theme_btn.setToolTip("Switch between light and dark mode (remembered)")
+        self.theme_btn.clicked.connect(self._toggle_theme)
+        self._label_theme_btn()
+        corner_row.addWidget(self.theme_btn)
+        self.tabs.setCornerWidget(corner, Qt.TopRightCorner)
         return self.tabs
 
     # ---------- signal wiring ----------
@@ -222,6 +252,7 @@ class MainWindow(QMainWindow):
         self.mqtt.request_received.connect(self._on_request)
         self.mqtt.command_received.connect(self._on_command)
 
+        self.course_map.clear_requested.connect(self._clear_map)
         self.course_tab.publish_requested.connect(self._publish_course)
         self.course_tab.clear_requested.connect(self._clear_course)
         self.course_tab.log.connect(self._log)
@@ -232,6 +263,7 @@ class MainWindow(QMainWindow):
 
     # ---------- connection ----------
     def _on_connect(self, host: str, port: int):
+        self.course_tab.set_rc_course(host_course(host if host not in ("localhost", "127.0.0.1") else ""))
         self.fleet.clear()
         self._team_links = {}
         self.course_map.clear()
@@ -290,6 +322,7 @@ class MainWindow(QMainWindow):
                 f"its GCS uses mid-run. Publish anyway?"):
             return
         if self._report_send(f"course {course.course_id}", self.sender.send_course(course)):
+            self.course_tab.mark_published(course)
             self._log(f"[SENT] RxCourse {course.course_id} "
                                       f"({len(course.corners)} corners, retained)")
 
@@ -299,6 +332,13 @@ class MainWindow(QMainWindow):
 
     def _start_run(self, team_id: str, declaration_seq: int, run_id: int):
         team = self.fleet.teams.get(team_id)
+        blockers = self.fleet.start_blockers(team_id)
+        if blockers:
+            msg = f"{team_id} not ready to start: {'; '.join(blockers)}"
+            self.statusBar().showMessage(msg)
+            QMessageBox.warning(self, "Not ready", msg + "\n\nEvery declared vehicle must be "
+                                "LIVE and in AUTO.")
+            return
         if team is not None and team.run_state == "ACTIVE" and not self._confirm(
                 "Restart run?", f"{team_id} is already ACTIVE (run {team.run_id}). "
                                 f"Send RunStart again with run {run_id}?"):
@@ -320,7 +360,11 @@ class MainWindow(QMainWindow):
         if not self._report_send(f"{name} to {team_id}", result):
             return
         self._log(f"[SENT] {team_id} seq={result.seq} {name}: {summary}")
-        if name != "run_start":
+        if name == "run_start":
+            # Clear the map now; don't depend on the broker echoing our RunStart back
+            self._log_notices(self.fleet.apply_run_start(team_id, result.seq, msg))
+            self._on_run_started(team_id)
+        else:
             self.incidents.record(team_id, result.seq, name, summary)
         if name == "readiness_confirm":
             self.incidents.mark_confirmed(team_id, msg.vehicle_id, msg.report_seq)
@@ -334,6 +378,8 @@ class MainWindow(QMainWindow):
         self.course_tab.show_broker_course(course)
         ring = [(c.latitude, c.longitude) for c in course.corners]
         self.task4_tab.set_course(ring, course_center(ring))
+        self._course = (ring, course.course_id)
+        self.recorder.set_course(ring, course.course_id)
         name = course.course_id or "<no id>"
         if issues:
             set_chip(self.course_id_label, f"COURSE {name} · INVALID", theme.FAULT)
@@ -354,7 +400,10 @@ class MainWindow(QMainWindow):
 
     def _on_report(self, team_id: str, vehicle_id: str, report):
         is_new = (team_id, vehicle_id) not in self.fleet.vehicles
+        track = self.fleet.vehicles.get((team_id, vehicle_id))
+        hb_before = track.last_hb_time if track else None
         self._log_notices(self.fleet.ingest_report(team_id, vehicle_id, report))
+        self._record_report(team_id, vehicle_id, report, hb_before)
         body = report.WhichOneof("body")
         if body and body != "heartbeat":
             self._log(f"[RxReport] {team_id}/{vehicle_id} seq={report.seq} {body}")
@@ -365,6 +414,20 @@ class MainWindow(QMainWindow):
             self._log(f"New vehicle reporting: {team_id}/{vehicle_id}")
             self._sync_team_filter()
 
+    def _record_report(self, team_id: str, vehicle_id: str, report, hb_before):
+        """Feed the run replay with what the map just drew (accepted reports only)."""
+        if not self.recorder.is_active(team_id):
+            return
+        track = self.fleet.vehicles.get((team_id, vehicle_id))
+        body = report.WhichOneof("body")
+        team = self.fleet.teams.get(team_id)
+        if body == "heartbeat" and track is not None and track.last_hb_time != hb_before:
+            self.recorder.track(team_id, vehicle_id, track.last_hb)
+        elif body == "safe_passage" and team is not None:
+            self.recorder.task(team_id, "safe_passage", team.safe_passage)
+        elif body == "pipeline_survey" and team is not None:
+            self.recorder.task(team_id, "pipeline", team.pipeline)
+
     def _on_request(self, team_id: str, request):
         if request.WhichOneof("body") == "run_declaration" and self.recorder.is_active(team_id):
             self._close_run_log(team_id, "team declared a new run")     # new run request
@@ -374,16 +437,34 @@ class MainWindow(QMainWindow):
         self._sync_team_filter()
 
     def _on_command(self, team_id: str, command):
+        echo = self.fleet.is_applied_run_start(team_id, command)
         notices = self.fleet.ingest_command(team_id, command)
-        team = self.fleet.teams.get(team_id)
-        if command.WhichOneof("body") == "run_start" and team is not None:
-            if self.recorder.is_active(team_id):
-                self._close_run_log(team_id, f"superseded by RunStart run_id={team.run_id}")
-            self.recorder.begin(team_id, team.run_id, team.declaration_seq)
         self._log(
             f"[RxCommand] {team_id} seq={command.seq} {command.WhichOneof('body')}")
+        if command.WhichOneof("body") == "run_start" and not echo:
+            self._on_run_started(team_id)       # RunStart from another tool
         self._log_notices(notices)
         self._sync_team_filter()
+
+    def _on_run_started(self, team_id: str):
+        """FleetState has applied a RunStart: start the run log, show the clean map."""
+        team = self.fleet.teams.get(team_id)
+        if team is None:
+            return
+        if self.recorder.is_active(team_id):
+            self._close_run_log(team_id, f"superseded by RunStart run_id={team.run_id}")
+        self.recorder.begin(team_id, team.run_id, team.declaration_seq,
+                            course=self._course, geofence=team.geofence)
+        self._log(f"[RUN START] {team_id} run {team.run_id}: map trails and task "
+                  f"overlays cleared")
+        self.refresh_views()
+
+    def _clear_map(self):
+        """Map tab Clear: drop trails and task overlays of the team shown (or all)."""
+        team = self.selected_team()
+        self.fleet.clear_drawings(team)
+        self._log(f"[MAP] trails and task overlays cleared ({team or 'all teams'})")
+        self.refresh_views()
 
     # ---------- run end (host only: the protocol has no run-end message) ----------
     def _end_run(self, team_id: str):
@@ -420,6 +501,8 @@ class MainWindow(QMainWindow):
 
     def _close_run_log(self, team_id: str, reason: str):
         path = self.recorder.finish(team_id, reason, self._run_summary(team_id))
+        if path is not None:
+            self.run_start_tab.reload_runs()
         if path is not None and reason != "ended by host":
             self._log(f"[RUN LOG] {team_id} previous run closed ({reason}); saved to {path}")
         return path

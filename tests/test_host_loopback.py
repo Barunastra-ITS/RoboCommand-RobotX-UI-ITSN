@@ -18,7 +18,7 @@ sys.path.insert(0, ROOT)
 sys.path.insert(0, os.path.join(ROOT, "tests"))
 
 from PyQt5.QtCore import QPointF
-from PyQt5.QtWidgets import QApplication
+from PyQt5.QtWidgets import QApplication, QLabel, QPushButton
 
 from fake_broker import FakeBroker
 from report import GcsReporter
@@ -55,8 +55,10 @@ class TestHostLoopback(unittest.TestCase):
         # Host console listens to everything and publishes through the same broker
         cls.presets_dir = tempfile.TemporaryDirectory()
         cls.run_dir = Path(cls.presets_dir.name) / "runs"
+        from PyQt5.QtCore import QSettings
+        cls.settings = QSettings(str(Path(cls.presets_dir.name) / "console.ini"), QSettings.IniFormat)
         cls.win = MainWindow(presets_path=Path(cls.presets_dir.name) / "presets.json",
-                             run_log_dir=cls.run_dir)
+                             run_log_dir=cls.run_dir, settings=cls.settings)
         cls.broker.subscribe(f"{TOPIC_ROOT}/#", lambda m: cls.win.mqtt._on_message(None, None, m))
         cls.host_published = []
 
@@ -119,6 +121,10 @@ class TestHostLoopback(unittest.TestCase):
         self.assertEqual(len(course.corners), 5)
         self.assertIn("VALID", tab.broker_summary.text())
         self.assertEqual(self.reporter.declaration_seq, declared)     # GCS did not re-declare
+        stamp = time.strftime("%Y-%m-%d %H:%M", time.localtime(course.sent_at.seconds))
+        self.assertIn(f"Last published {stamp}", tab.last_published.text())
+        self.assertIn("ALPHA", tab.last_published.text())
+        self.assertIn(f"published {stamp}", tab.broker_summary.text())
 
     def test_2b2_pinning_corners_on_the_map_fills_the_table(self):
         from PyQt5.QtCore import QPoint, Qt
@@ -157,6 +163,21 @@ class TestHostLoopback(unittest.TestCase):
         self.assertEqual(tab.selected_team(), TEAM)         # the waiting team is preselected
         self.assertTrue(tab.start_btn.isEnabled())
 
+    def test_2d_start_needs_every_declared_vehicle_live_and_auto(self):
+        tab = self.win.run_start_tab
+        self.reporter.update("USV1", lat=1.2806, lng=103.8557, heading_deg=0, state="MANUAL")
+        drain(0.8)
+        self.win.refresh_views()
+        tab.select_team(TEAM)
+        self.assertFalse(tab.start_btn.isEnabled())
+        self.assertIn("USV1 MANUAL (needs AUTO)", tab.detail.text())
+        self.assertEqual(tab.table.item(0, 4).text(), "1/2")
+        self.reporter.update("USV1", lat=1.2806, lng=103.8557, heading_deg=0, state="AUTO")
+        drain(0.8)
+        self.win.refresh_views()
+        self.assertTrue(tab.start_btn.isEnabled())
+        self.assertEqual(tab.table.item(0, 4).text(), "2/2")
+
     def test_3_boat_movement_is_tracked(self):
         usv = self.win.fleet.vehicles[(TEAM, "USV1")]
         self.assertGreaterEqual(len(usv.trail), 4)
@@ -177,10 +198,14 @@ class TestHostLoopback(unittest.TestCase):
 
     def test_4b_allow_start_from_console(self):
         tab = self.win.run_start_tab
+        usv = self.win.fleet.vehicles[(TEAM, "USV1")]
+        before = len(usv.trail)
         tab.run_id.setValue(7)
         tab.start_btn.click()
         drain(0.3)
         self.win.refresh_views()
+        self.assertLess(len(usv.trail), before)              # the new run starts with a clean map
+        self.assertIn("[RUN START] ITSN run 7: map trails", self.log_text())
         self.assertEqual(self.reporter.run_id, 7)
         self.assertEqual(self.win.teams_panel.row_text(TEAM)[1], "ACTIVE")
         self.assertEqual(tab.start_btn.text(), "Restart run")
@@ -281,6 +306,33 @@ class TestHostLoopback(unittest.TestCase):
         self.assertIsNone(self.win.vehicle_monitor.card(TEAM, "USV1"))
         self.win.team_filter.setCurrentText("All teams")
 
+    def test_8a_map_clear_button_clears_trails_and_overlays(self):
+        win = self.win
+        win.fleet.teams[TEAM].pipeline = ((1.2806, 103.8557), [1])
+        win.team_filter.setCurrentText(TEAM)
+        win.refresh_views()
+        clear_btn = [b for b in win.course_map.findChildren(QPushButton) if b.text() == "Clear"][0]
+        clear_btn.click()
+        self.assertTrue(all(len(v.trail) == 0 for v in win.fleet.vehicles_of(TEAM)))
+        self.assertIsNone(win.fleet.teams[TEAM].pipeline)
+        self.assertIsNone(win.course_map._canvas._pl_active)
+        self.assertIn(f"[MAP] trails and task overlays cleared ({TEAM})", self.log_text())
+        win.team_filter.setCurrentText("All teams")
+
+    def test_8d_theme_toggle_switches_and_is_remembered(self):
+        from robocommand_ui import theme
+        win = self.win
+        self.assertEqual(theme.mode(), theme.LIGHT)            # light by default
+        win.theme_btn.click()
+        self.assertEqual(theme.mode(), theme.DARK)
+        self.assertEqual(self.settings.value("theme"), "dark")
+        self.assertIn(theme.PALETTES["dark"]["BG"], app.styleSheet())
+        dot = win.course_tab.findChildren(QLabel, "PanelDot")[0]
+        self.assertNotIn(theme.PALETTES["light"]["ACCENT"], dot.styleSheet())
+        win.theme_btn.click()
+        self.assertEqual(theme.mode(), theme.LIGHT)
+        self.assertIn(theme.PALETTES["light"]["BG"], app.styleSheet())
+
     def test_9b_gcs_link_loss_is_shown(self):
         self.reporter.stop()                    # GCS goes away: heartbeats stop
         for v in self.win.fleet.vehicles_of(TEAM):
@@ -312,6 +364,16 @@ class TestHostLoopback(unittest.TestCase):
         self.assertIn("ended by host", text)
         self.assertIn("assistance_request", text)          # Task 4 history in the summary
         self.assertIn("[RxCommand] ITSN seq=", text)
+        runs = tab._runs
+        self.assertEqual([r.run_id for r in runs], [42, 7])   # newest first, by Run ID
+        self.assertEqual(tab.runs_table.item(0, 0).text(), "42")
+        from robocommand_ui.run_replay import load_run
+        replay = load_run(runs[0].replay_path)
+        self.assertEqual(replay.course_id, "ALPHA")
+        self.assertEqual(replay.vehicle_ids, ["UAV1", "USV1"])
+        self.assertIn("USV1", replay.frame(replay.duration).vehicles)
+        tab.runs_table.selectRow(0)
+        self.assertTrue(tab.replay_btn.isEnabled())
         win.refresh_views()
         tab.select_team(TEAM)
         self.assertFalse(tab.start_btn.isEnabled())         # no restart without a new request

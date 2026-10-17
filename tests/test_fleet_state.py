@@ -15,11 +15,11 @@ TEAM = "ITSN"
 
 
 def heartbeat(seq, lat=1.2806, lng=103.8557, task=rx_common_pb2.TASK_NONE,
-              vehicle="USV1", team=TEAM):
+              vehicle="USV1", team=TEAM, state=common_pb2.STATE_AUTO):
     return rx_reports_pb2.RxReport(
         team_id=team, vehicle_id=vehicle, seq=seq,
         heartbeat=rx_reports_pb2.Heartbeat(
-            state=common_pb2.STATE_AUTO,
+            state=state,
             position=common_pb2.LatLng(latitude=lat, longitude=lng),
             vehicle_type=rx_common_pb2.TYPE_USV,
             current_task=task,
@@ -217,6 +217,131 @@ class TestRunState(unittest.TestCase):
         self.assertEqual(entry, (1.0, 2.0))
         self.assertEqual(buoys[0][2], rx_common_pb2.BEACON_STATE_FLASHING_RED)
         self.assertEqual(fleet.vehicles[(TEAM, "USV1")].reports, {"safe_passage": 1})
+
+
+class TestRunStartClearsTheMap(unittest.TestCase):
+    def test_run_start_clears_trails_and_task_overlays_of_that_team_only(self):
+        fleet = FleetState()
+        fleet.ingest_request(TEAM, declaration(1), now=0.0)
+        fleet.ingest_report(TEAM, "USV1", heartbeat(1, lat=1.0), now=1.0)
+        fleet.ingest_report(TEAM, "USV1", heartbeat(2, lat=1.1), now=1.5)
+        fleet.ingest_report("RNRX", "USV1", heartbeat(1, team="RNRX"), now=1.0)
+        fleet.teams[TEAM].pipeline = ((1.0, 2.0), [1])
+        fleet.teams[TEAM].safe_passage = ((1.0, 2.0), (1.1, 2.1), [])
+
+        fleet.ingest_command(TEAM, run_start(1))
+
+        team = fleet.teams[TEAM]
+        self.assertIsNone(team.pipeline)
+        self.assertIsNone(team.safe_passage)
+        self.assertEqual(list(fleet.vehicles[(TEAM, "USV1")].trail), [])
+        self.assertIsNotNone(fleet.vehicles[(TEAM, "USV1")].last_hb)    # boat still shown
+        self.assertEqual(len(fleet.vehicles[("RNRX", "USV1")].trail), 1)
+
+    def test_trail_grows_again_after_run_start(self):
+        fleet = FleetState()
+        fleet.ingest_report(TEAM, "USV1", heartbeat(1), now=1.0)
+        fleet.ingest_command(TEAM, run_start(1))
+        fleet.ingest_report(TEAM, "USV1", heartbeat(2, lat=1.3), now=1.5)
+        self.assertEqual(len(fleet.vehicles[(TEAM, "USV1")].trail), 1)
+
+    def test_own_run_start_clears_on_send_and_its_echo_does_not_clear_again(self):
+        fleet = FleetState()
+        fleet.ingest_report(TEAM, "USV1", heartbeat(1), now=1.0)
+        command = run_start(1)
+        fleet.apply_run_start(TEAM, command.seq, command.run_start)     # published by us
+        self.assertEqual(list(fleet.vehicles[(TEAM, "USV1")].trail), [])
+        fleet.ingest_report(TEAM, "USV1", heartbeat(2, lat=1.3), now=1.5)
+        self.assertTrue(fleet.is_applied_run_start(TEAM, command))
+        self.assertEqual(fleet.ingest_command(TEAM, command), [])       # broker echo
+        self.assertEqual(len(fleet.vehicles[(TEAM, "USV1")].trail), 1)  # first point kept
+        self.assertEqual(fleet.teams[TEAM].run_state, "ACTIVE")
+
+    def test_other_run_start_with_the_same_seq_still_clears(self):
+        fleet = FleetState()
+        mine = run_start(1, run_id=7)
+        fleet.apply_run_start(TEAM, mine.seq, mine.run_start)
+        fleet.ingest_report(TEAM, "USV1", heartbeat(1), now=1.0)
+        other = run_start(1, run_id=8)                  # same seq, another tool
+        self.assertFalse(fleet.is_applied_run_start(TEAM, other))
+        fleet.ingest_command(TEAM, other)
+        self.assertEqual(list(fleet.vehicles[(TEAM, "USV1")].trail), [])
+        self.assertEqual(fleet.teams[TEAM].run_id, 8)
+
+    def test_late_echo_of_an_earlier_run_start_is_not_a_new_run(self):
+        fleet = FleetState()
+        first, second = run_start(1, run_id=1), run_start(1, run_id=2)
+        first.seq, second.seq = 5, 6
+        fleet.apply_run_start(TEAM, first.seq, first.run_start)
+        fleet.apply_run_start(TEAM, second.seq, second.run_start)
+        fleet.ingest_report(TEAM, "USV1", heartbeat(1), now=1.0)
+        self.assertEqual(fleet.ingest_command(TEAM, first), [])          # arrives late
+        self.assertEqual(fleet.teams[TEAM].run_id, 2)
+        self.assertEqual(len(fleet.vehicles[(TEAM, "USV1")].trail), 1)
+
+    def test_manual_clear_of_one_team_or_all(self):
+        fleet = FleetState()
+        fleet.ingest_report(TEAM, "USV1", heartbeat(1), now=1.0)
+        fleet.ingest_report("RNRX", "USV1", heartbeat(1, team="RNRX"), now=1.0)
+        fleet.teams["RNRX"].pipeline = ((1.0, 2.0), [1])
+        fleet.clear_drawings(TEAM)
+        self.assertEqual(list(fleet.vehicles[(TEAM, "USV1")].trail), [])
+        self.assertEqual(len(fleet.vehicles[("RNRX", "USV1")].trail), 1)
+        fleet.clear_drawings()
+        self.assertEqual(list(fleet.vehicles[("RNRX", "USV1")].trail), [])
+        self.assertIsNone(fleet.teams["RNRX"].pipeline)
+        self.assertIsNotNone(fleet.vehicles[("RNRX", "USV1")].last_hb)
+
+
+class TestStartBlockers(unittest.TestCase):
+    def setUp(self):
+        self.fleet = FleetState()
+        self.fleet.ingest_request(TEAM, declaration(1, vehicles=("USV1", "UAV1")), now=0.0)
+
+    def test_all_declared_vehicles_live_and_auto_can_start(self):
+        self.fleet.ingest_report(TEAM, "USV1", heartbeat(1), now=10.0)
+        self.fleet.ingest_report(TEAM, "UAV1", heartbeat(1, vehicle="UAV1"), now=10.0)
+        self.assertEqual(self.fleet.start_blockers(TEAM, now=11.0), [])
+
+    def test_silent_stale_and_manual_vehicles_block(self):
+        self.fleet.ingest_report(TEAM, "USV1", heartbeat(1, state=common_pb2.STATE_MANUAL),
+                                 now=10.0)
+        self.assertEqual(self.fleet.start_blockers(TEAM, now=11.0),
+                         ["USV1 MANUAL (needs AUTO)", "UAV1 no heartbeat"])
+        self.fleet.ingest_report(TEAM, "UAV1", heartbeat(1, vehicle="UAV1"), now=10.0)
+        self.assertEqual(self.fleet.start_blockers(TEAM, now=20.0),
+                         ["USV1 stale (10.0 s)", "UAV1 stale (10.0 s)"])
+
+    def test_no_declaration_blocks(self):
+        self.assertEqual(self.fleet.start_blockers("NOBODY", now=1.0), ["no vehicles declared"])
+
+
+class TestDeclarationReplacesVehicles(unittest.TestCase):
+    def test_vehicles_left_out_of_a_new_declaration_are_removed(self):
+        fleet = FleetState()
+        fleet.ingest_request(TEAM, declaration(1, vehicles=("USV1", "UAV1")), now=0.0)
+        fleet.ingest_report(TEAM, "UAV1", heartbeat(1, vehicle="UAV1"), now=1.0)
+        fleet.ingest_report("RNRX", "UAV1", heartbeat(1, vehicle="UAV1", team="RNRX"), now=1.0)
+
+        notices = fleet.ingest_request(TEAM, declaration(2, vehicles=("USV1",)), now=2.0)
+
+        self.assertEqual([v.vehicle_id for v in fleet.vehicles_of(TEAM)], ["USV1"])
+        self.assertIn(("RNRX", "UAV1"), fleet.vehicles)          # other teams untouched
+        self.assertIn(f"{TEAM}/UAV1 removed: not in the new declaration", notices)
+
+    def test_undeclared_vehicle_reporting_is_warned_once(self):
+        fleet = FleetState()
+        fleet.ingest_request(TEAM, declaration(1, vehicles=("USV1",)), now=0.0)
+        first = fleet.ingest_report(TEAM, "UAV1", heartbeat(1, vehicle="UAV1"), now=1.0)
+        second = fleet.ingest_report(TEAM, "UAV1", heartbeat(2, vehicle="UAV1"), now=1.5)
+        self.assertEqual(first, [f"[WARN] {TEAM}/UAV1 reports but is not declared "
+                                 f"(declared: USV1)"])
+        self.assertEqual(second, [])
+        self.assertIn((TEAM, "UAV1"), fleet.vehicles)            # still drawn: it is really there
+
+    def test_no_warning_before_any_declaration(self):
+        fleet = FleetState()
+        self.assertEqual(fleet.ingest_report(TEAM, "UAV1", heartbeat(1, vehicle="UAV1"), now=1.0), [])
 
 
 if __name__ == "__main__":

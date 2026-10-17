@@ -9,20 +9,24 @@ the course so the grid and scale bar are true distances.
 Satellite imagery (same source as the OCS map, cached on disk) is drawn
 underneath when available; **Satellite** toggles it.
 
-Mouse: wheel zooms about the cursor, drag pans, double-click re-fits.
+Mouse: wheel zooms about the cursor, drag pans, Shift+drag turns the map,
+the compass (top right) turns it back to north-up, double-click re-fits.
 """
 
 import math
 import time
 from typing import Dict, List, Optional, Tuple
 
-from PyQt5.QtCore import QPointF, QRectF, Qt
+from PyQt5.QtCore import QPointF, QRectF, Qt, pyqtSignal
 from PyQt5.QtGui import QBrush, QFontMetrics, QPainter, QPainterPath, QPen, QPolygonF
 from PyQt5.QtWidgets import QPushButton, QWidget
 
 from robocommand_ui import theme
 from robocommand_ui.fleet_state import STALE_SECONDS
 from robocommand_ui.proto_helper import rx_common_pb2, vehicle_type_name
+from robocommand_ui.widgets.compass import (
+    draw_compass, drag_bearing, on_compass, rotate, unrotate,
+)
 from robocommand_ui.widgets.panel import Panel
 from robocommand_ui.widgets.tiles import (
     ATTRIBUTION, MAX_ZOOM, TILE_SIZE, shared_loader, unit_to_latlng, unit_xy,
@@ -51,6 +55,8 @@ SEGMENTS = {
 
 
 class CourseMapWidget(Panel):
+    clear_requested = pyqtSignal()          # operator wants trails / task overlays gone
+
     def __init__(self, parent=None):
         super().__init__("Course map", parent, body_margins=(0, 0, 0, 0))
         self._canvas = MapCanvas(self)
@@ -73,6 +79,14 @@ class CourseMapWidget(Panel):
         self.trails_btn.setToolTip("Show each vehicle's reported track")
         self.trails_btn.toggled.connect(self._canvas.set_show_trails)
         self.actions.addWidget(self.trails_btn)
+
+        clear_btn = QPushButton("Clear")
+        clear_btn.setObjectName("Ghost")
+        clear_btn.setCursor(Qt.PointingHandCursor)
+        clear_btn.setToolTip("Clear trails and Task 1 / Task 2 overlays of the team shown\n"
+                             "(every RunStart does this automatically)")
+        clear_btn.clicked.connect(self.clear_requested)
+        self.actions.addWidget(clear_btn)
 
         fit_btn = QPushButton("Fit")
         fit_btn.setObjectName("Ghost")
@@ -153,6 +167,9 @@ class MapCanvas(QWidget):
         self._center_m = (0.0, 0.0)           # metres at widget centre
         self._user_view = False
         self._drag_from: Optional[QPointF] = None
+        self._bearing = 0.0                   # compass direction shown up (Shift+drag)
+        self._rotating = False
+        self._compass_hover = False
 
     # ---------------- data ----------------
     def set_course_points(self, points, course_id=""):
@@ -190,6 +207,13 @@ class MapCanvas(QWidget):
         self._user_view = False
         self.update()
 
+    def bearing(self) -> float:
+        return self._bearing
+
+    def set_bearing(self, bearing: float) -> None:
+        self._bearing = bearing % 360.0
+        self.update()
+
     # ---------------- projection ----------------
     def _ensure_origin(self) -> bool:
         if self._origin is None:
@@ -210,24 +234,50 @@ class MapCanvas(QWidget):
         return self._m_to_px(x, y)
 
     def _m_to_px(self, x: float, y: float) -> QPointF:
+        """Metres -> pixels on the map as shown (turned to the bearing)."""
+        q = self._m_to_px0(x, y)
+        w2, h2 = self.width() / 2, self.height() / 2
+        rx, ry = rotate(q.x() - w2, q.y() - h2, self._bearing)
+        return QPointF(w2 + rx, h2 + ry)
+
+    def _px_to_m(self, p: QPointF) -> Tuple[float, float]:
+        w2, h2 = self.width() / 2, self.height() / 2
+        ux, uy = unrotate(p.x() - w2, p.y() - h2, self._bearing)
+        return self._px0_to_m(QPointF(w2 + ux, h2 + uy))
+
+    def _m_to_px0(self, x: float, y: float) -> QPointF:
+        """Metres -> pixels on the north-up map (before turning)."""
         cx, cy = self._center_m
         return QPointF(self.width() / 2 + (x - cx) * self._scale,
                        self.height() / 2 - (y - cy) * self._scale)
 
-    def _px_to_m(self, p: QPointF) -> Tuple[float, float]:
+    def _px0_to_m(self, p: QPointF) -> Tuple[float, float]:
         cx, cy = self._center_m
         return (cx + (p.x() - self.width() / 2) / self._scale,
                 cy - (p.y() - self.height() / 2) / self._scale)
+
+    def _north_up_view(self) -> QRectF:
+        """North-up pixel area that covers the turned widget (its circumscribed square)."""
+        r = math.hypot(self.width(), self.height()) / 2
+        return QRectF(self.width() / 2 - r, self.height() / 2 - r, 2 * r, 2 * r)
+
+    def _turned(self, p: QPainter) -> None:
+        """Make ``p`` draw north-up coordinates onto the turned map."""
+        p.translate(self.width() / 2, self.height() / 2)
+        p.rotate(-self._bearing)
+        p.translate(-self.width() / 2, -self.height() / 2)
 
     def _fit(self):
         pts = list(self._course_points) + list(self._geofence_points)
         if not pts:
             pts = [(hb.position.latitude, hb.position.longitude) for hb, _, _ in self._vehicles.values()]
-        ms = [self.to_m(a, b) for a, b in pts]
-        xs, ys = [m[0] for m in ms], [m[1] for m in ms]
+        # extents in the turned frame (x right, y down on screen), in metres
+        turned = [rotate(x, -y, self._bearing) for x, y in (self.to_m(a, b) for a, b in pts)]
+        xs, ys = [t[0] for t in turned], [t[1] for t in turned]
         w = max(max(xs) - min(xs), 20.0)
         h = max(max(ys) - min(ys), 20.0)
-        self._center_m = ((max(xs) + min(xs)) / 2, (max(ys) + min(ys)) / 2)
+        cx, cy = unrotate((max(xs) + min(xs)) / 2, (max(ys) + min(ys)) / 2, self._bearing)
+        self._center_m = (cx, -cy)
         self._scale = min(self.width() / (w * (1 + 2 * FIT_MARGIN)),
                           self.height() / (h * (1 + 2 * FIT_MARGIN)))
 
@@ -245,25 +295,44 @@ class MapCanvas(QWidget):
         self.update()
 
     def mousePressEvent(self, e):
-        if e.button() == Qt.LeftButton:
-            self._drag_from = QPointF(e.pos())
-            self.setCursor(Qt.ClosedHandCursor)
+        if e.button() != Qt.LeftButton:
+            return
+        if self._origin is not None and on_compass(QPointF(e.pos()), self.width()):
+            self.set_bearing(0.0)               # back to north-up
+            return
+        self._drag_from = QPointF(e.pos())
+        self._rotating = bool(e.modifiers() & Qt.ShiftModifier)
+        self.setCursor(Qt.SizeAllCursor if self._rotating else Qt.ClosedHandCursor)
 
     def mouseMoveEvent(self, e):
-        if self._drag_from is not None:
-            d = QPointF(e.pos()) - self._drag_from
+        pos = QPointF(e.pos())
+        if self._drag_from is None:
+            hover = self._origin is not None and on_compass(pos, self.width())
+            if hover != self._compass_hover:
+                self._compass_hover = hover
+                self.setCursor(Qt.PointingHandCursor if hover else Qt.OpenHandCursor)
+                self.update()
+            return
+        if self._rotating:
+            center = QPointF(self.width() / 2, self.height() / 2)
+            self._bearing = drag_bearing(self._bearing, center, self._drag_from, pos)
+        else:
+            d = pos - self._drag_from
+            dx, dy = unrotate(d.x(), d.y(), self._bearing)
             cx, cy = self._center_m
-            self._center_m = (cx - d.x() / self._scale, cy + d.y() / self._scale)
-            self._drag_from = QPointF(e.pos())
-            self._user_view = True
-            self.update()
+            self._center_m = (cx - dx / self._scale, cy + dy / self._scale)
+        self._drag_from = pos
+        self._user_view = True
+        self.update()
 
     def mouseReleaseEvent(self, e):
         self._drag_from = None
+        self._rotating = False
         self.setCursor(Qt.OpenHandCursor)
 
     def mouseDoubleClickEvent(self, e):
-        self.reset_view()
+        if not on_compass(QPointF(e.pos()), self.width()):
+            self.reset_view()
 
     # ---------------- painting ----------------
     def paintEvent(self, event):
@@ -294,8 +363,8 @@ class MapCanvas(QWidget):
         self._draw_scale_and_north(p)
         self._draw_legend(p)
 
-    def _px_to_latlng(self, q: QPointF) -> LatLng:
-        x, y = self._px_to_m(q)
+    def _px0_to_latlng(self, q: QPointF) -> LatLng:
+        x, y = self._px0_to_m(q)
         lat0, lng0 = self._origin
         return (lat0 + y / M_PER_DEG_LAT,
                 lng0 + x / (M_PER_DEG_LAT * math.cos(math.radians(lat0))))
@@ -307,20 +376,24 @@ class MapCanvas(QWidget):
         z = int(max(0, min(MAX_ZOOM, round(math.log2(
             EARTH_M_PER_PX_Z0 * math.cos(math.radians(lat0)) / mpp)))))
         n = 1 << z
-        ux0, uy0 = unit_xy(*self._px_to_latlng(QPointF(0, 0)))
-        ux1, uy1 = unit_xy(*self._px_to_latlng(QPointF(self.width(), self.height())))
+        view = self._north_up_view()
+        ux0, uy0 = unit_xy(*self._px0_to_latlng(view.topLeft()))
+        ux1, uy1 = unit_xy(*self._px0_to_latlng(view.bottomRight()))
         drew = False
+        p.save()
+        self._turned(p)
         for tx in range(math.floor(ux0 * n), math.floor(ux1 * n) + 1):
             for ty in range(max(0, math.floor(uy0 * n)), min(n - 1, math.floor(uy1 * n)) + 1):
                 pix = self._tiles.tile(z, tx, ty)
                 if pix is None:
                     continue
-                nw = self.to_px(*unit_to_latlng(tx / n, ty / n))
-                se = self.to_px(*unit_to_latlng((tx + 1) / n, (ty + 1) / n))
+                nw = self._m_to_px0(*self.to_m(*unit_to_latlng(tx / n, ty / n)))
+                se = self._m_to_px0(*self.to_m(*unit_to_latlng((tx + 1) / n, (ty + 1) / n)))
                 p.drawPixmap(QRectF(nw, se).adjusted(0, 0, 0.5, 0.5), pix, QRectF(pix.rect()))
                 drew = True
+        p.restore()
         if drew:
-            p.fillRect(self.rect(), theme.qcolor(theme.BG, 70))     # keep overlays readable
+            p.fillRect(self.rect(), theme.qcolor(theme.MAP_DIM, 70))     # keep overlays readable
             p.setPen(theme.qcolor(theme.TEXT_MUTED))
             p.setFont(theme.ui_font(7.5))
             p.drawText(QRectF(0, self.height() - 16, self.width(), 14), Qt.AlignCenter,
@@ -353,7 +426,7 @@ class MapCanvas(QWidget):
     def _draw_empty(self, p):
         """Centred card over the world view (or the plain well when offline)."""
         r = QRectF(self.rect())
-        card = QRectF(0, 0, min(420.0, r.width() - 40), 168)
+        card = QRectF(0, 0, min(320.0, r.width() - 40), 132)
         card.moveCenter(r.center())
         p.setPen(QPen(theme.qcolor(theme.BORDER), 1))
         p.setBrush(QBrush(theme.qcolor(theme.SURFACE, 215)))
@@ -371,11 +444,7 @@ class MapCanvas(QWidget):
         p.setPen(theme.qcolor(theme.TEXT))
         p.setFont(theme.ui_font(12, 700))
         p.drawText(QRectF(card.left(), card.top() + 88, card.width(), 26), Qt.AlignCenter,
-                   "WAITING FOR RXCOURSE")
-        p.setPen(theme.qcolor(theme.TEXT_MUTED))
-        p.setFont(theme.ui_font(9.5))
-        p.drawText(QRectF(card.left(), card.top() + 116, card.width(), 22), Qt.AlignCenter,
-                   "course boundary / vehicle heartbeats")
+                   "NO COURSE")
 
     def _grid_step(self) -> float:
         for step in GRID_STEPS_M:
@@ -385,26 +454,33 @@ class MapCanvas(QWidget):
 
     def _draw_grid(self, p):
         step = self._grid_step()
-        x0, y1 = self._px_to_m(QPointF(0, 0))
-        x1, y0 = self._px_to_m(QPointF(self.width(), self.height()))
+        view = self._north_up_view()
+        x0, y1 = self._px0_to_m(view.topLeft())
+        x1, y0 = self._px0_to_m(view.bottomRight())
+        p.save()
+        self._turned(p)
         p.setPen(QPen(theme.qcolor(theme.MAP_GRID), 1))
         gx = math.floor(x0 / step) * step
         while gx <= x1:
-            q = self._m_to_px(gx, 0)
-            p.drawLine(QPointF(q.x(), 0), QPointF(q.x(), self.height()))
+            q = self._m_to_px0(gx, 0)
+            p.drawLine(QPointF(q.x(), view.top()), QPointF(q.x(), view.bottom()))
             gx += step
         gy = math.floor(y0 / step) * step
         while gy <= y1:
-            q = self._m_to_px(0, gy)
-            p.drawLine(QPointF(0, q.y()), QPointF(self.width(), q.y()))
+            q = self._m_to_px0(0, gy)
+            p.drawLine(QPointF(view.left(), q.y()), QPointF(view.right(), q.y()))
             gy += step
+        p.restore()
 
     def _draw_boundary(self, p):
         if len(self._course_points) < 3:
             return
         poly = QPolygonF([self.to_px(a, b) for a, b in self._course_points])
         p.setBrush(QBrush(theme.qcolor(theme.MAP_BOUNDARY, 14)))
-        p.setPen(QPen(theme.qcolor(theme.MAP_BOUNDARY, 200), 1.6))
+        p.setPen(QPen(theme.qcolor(theme.MAP_DIM, 150), 3.6))     # halo: readable on any ground
+        p.drawPolygon(poly)
+        p.setBrush(Qt.NoBrush)
+        p.setPen(QPen(theme.qcolor(theme.MAP_BOUNDARY, 230), 1.6))
         p.drawPolygon(poly)
         p.setBrush(QBrush(theme.qcolor(theme.MAP_BOUNDARY)))
         p.setPen(Qt.NoPen)
@@ -470,7 +546,7 @@ class MapCanvas(QWidget):
             q = self.to_px(hb.position.latitude, hb.position.longitude)
             alpha = 110 if stale else 255
             # heading arrow
-            h = math.radians(hb.heading_deg)
+            h = math.radians(hb.heading_deg - self._bearing)       # as drawn on the turned map
             fwd = QPointF(math.sin(h), -math.cos(h))
             side = QPointF(-fwd.y(), fwd.x())
             arrow = QPolygonF([q + fwd * 11, q - fwd * 7 + side * 7, q - fwd * 3, q - fwd * 7 - side * 7])
@@ -503,14 +579,7 @@ class MapCanvas(QWidget):
         p.drawLine(QPointF(x + length, y - 4), QPointF(x + length, y + 1))
         p.setFont(theme.mono_font(8))
         p.drawText(QPointF(x, y - 7), f"{step:g} m")
-        # north marker
-        nx, ny = self.width() - 22, 26
-        p.setPen(Qt.NoPen)
-        p.setBrush(QBrush(theme.qcolor(theme.TEXT_MUTED)))
-        p.drawPolygon(QPolygonF([QPointF(nx, ny - 10), QPointF(nx - 5, ny + 4), QPointF(nx + 5, ny + 4)]))
-        p.setPen(theme.qcolor(theme.TEXT_MUTED))
-        p.setFont(theme.ui_font(8, 700))
-        p.drawText(QRectF(nx - 10, ny + 5, 20, 14), Qt.AlignCenter, "N")
+        draw_compass(p, self.width(), self._bearing, self._compass_hover)
 
     def _draw_legend(self, p):
         types = sorted({vehicle_type_name(hb.vehicle_type) for hb, _, _ in self._vehicles.values()})

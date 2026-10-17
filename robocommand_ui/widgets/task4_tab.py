@@ -109,8 +109,6 @@ class Task4Tab(QWidget):
         form.addRow("Go to", self.assist_pos)
         panel.body.addLayout(form)
         panel.body.addWidget(self._send_button("Send assistance request", self._send_assist))
-        panel.body.addWidget(caption("Team answers IncidentAck, transits, loiters, then "
-                                     "sends ReadinessReport."))
 
         panel.body.addWidget(heading("Readiness confirm"))
         form = _form()
@@ -121,7 +119,7 @@ class Task4Tab(QWidget):
         self.confirm_seq.setToolTip("RxReport.seq of the ReadinessReport (R), not the command seq")
         form.addRow("Report seq R", self.confirm_seq)
         panel.body.addLayout(form)
-        self.confirm_hint = caption("Filled in when a ReadinessReport arrives.")
+        self.confirm_hint = caption("")
         panel.body.addWidget(self.confirm_hint)
         panel.body.addWidget(self._send_button("Send readiness confirm", self._send_confirm))
         panel.body.addStretch()
@@ -139,7 +137,6 @@ class Task4Tab(QWidget):
         form.addRow("Radius", self.koz_radius)
         panel.body.addLayout(form)
         panel.body.addWidget(self._send_button("Send keep-out zone", self._send_koz))
-        panel.body.addWidget(caption("Team acks and keeps out of the circle until All clear."))
 
         panel.body.addWidget(heading("All clear"))
         form = _form()
@@ -147,7 +144,6 @@ class Task4Tab(QWidget):
         form.addRow("Vehicle type", self.clear_type)
         panel.body.addLayout(form)
         panel.body.addWidget(self._send_button("Send all clear", self._send_all_clear))
-        panel.body.addWidget(caption("Lifts the keep-out zone for that type. Team acks again."))
         panel.body.addStretch()
         return panel
 
@@ -163,6 +159,7 @@ class Task4Tab(QWidget):
         self.mo_speed = number_spin(0.0, 20.0, 1.0, 2, " m/s")
         form.addRow("Speed", self.mo_speed)
         affected = QHBoxLayout()
+        affected.setSpacing(16)
         self.mo_types = {}
         for name in commands.VEHICLE_TYPES:
             box = QCheckBox(name)
@@ -174,8 +171,6 @@ class Task4Tab(QWidget):
         form.addRow("Affects", affected)
         panel.body.addLayout(form)
         panel.body.addWidget(self._send_button("Send moving object alert", self._send_moving))
-        panel.body.addWidget(caption("No ack. Affected vehicles keep more than 10 m away. "
-                                     "Send again with a new position to move the object."))
         panel.body.addStretch()
         return panel
 

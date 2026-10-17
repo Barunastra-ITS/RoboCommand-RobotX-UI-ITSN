@@ -55,7 +55,7 @@ class TeamsPanel(Panel):
         self.table.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.table.setToolTip("Tiers T1–T4: C core · A advanced · D disruptive · – not attempted")
         self.body.addWidget(self.table)
-        self._empty = QLabel("No team traffic yet.")
+        self._empty = QLabel("No teams")
         self._empty.setObjectName("Empty")
         self._empty.setAlignment(Qt.AlignCenter)
         self.body.addWidget(self._empty)

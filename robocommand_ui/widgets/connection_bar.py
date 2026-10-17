@@ -31,6 +31,7 @@ class ConnectionBar(QWidget):
         self.preset_combo.addItems(list(COURSE_PRESETS))
         self.preset_combo.setCurrentText(LOCAL_PRESET)
         self.preset_combo.setSizeAdjustPolicy(QComboBox.AdjustToContents)
+        self.preset_combo.setMinimumWidth(170)
         self.preset_combo.setCursor(Qt.PointingHandCursor)
         self.preset_combo.setToolTip("Broker to monitor")
         self.preset_combo.currentIndexChanged.connect(self._on_preset_changed)

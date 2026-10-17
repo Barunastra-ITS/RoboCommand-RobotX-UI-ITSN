@@ -8,7 +8,7 @@ from robocommand_ui.main_window import MainWindow
 
 def main():
     app = QApplication(sys.argv)
-    app.setApplicationName("RoboCommand RobotX 2026 Host Monitor")
+    app.setApplicationName("RoboCommand")
     app.setOrganizationName("Barunastra ITS")
     window = MainWindow()
     window.show()

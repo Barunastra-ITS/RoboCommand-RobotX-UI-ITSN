@@ -2,7 +2,8 @@
 
 Click empty map to add a corner (on an edge it is inserted there), drag a
 pin to move it, right-click a pin to delete it. Wheel zooms about the
-cursor, drag on empty map pans. Every change emits ``corners_changed`` with
+cursor, drag on empty map pans, Shift+drag turns the map and the compass
+(top right) turns it back to north-up. Every change emits ``corners_changed`` with
 the open ring (the Course tab closes it on publish).
 """
 
@@ -14,6 +15,9 @@ from PyQt5.QtGui import QBrush, QPainter, QPainterPath, QPen, QPolygonF
 from PyQt5.QtWidgets import QWidget
 
 from robocommand_ui import theme
+from robocommand_ui.widgets.compass import (
+    draw_compass, drag_bearing, on_compass, rotate, unrotate,
+)
 from robocommand_ui.widgets.tiles import (
     ATTRIBUTION, MAX_ZOOM, TILE_SIZE, metres_per_pixel, shared_loader, unit_to_latlng, unit_xy,
 )
@@ -29,6 +33,7 @@ SCALE_STEPS_M = (1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000)
 
 class BoundaryMap(QWidget):
     corners_changed = pyqtSignal(list)          # [(lat, lng), ...] open ring
+    view_changed = pyqtSignal(float, float)     # centre lat, lng after a pan / zoom / jump
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -45,14 +50,24 @@ class BoundaryMap(QWidget):
         self._panning = False
         self._hover_pin: Optional[int] = None
         self._has_center = False
+        self._bearing = 0.0                     # compass direction shown up (Shift+drag)
+        self._rotating = False
+        self._compass_hover = False
 
     # ---------- view ----------
+    def bearing(self) -> float:
+        return self._bearing
+
+    def set_bearing(self, bearing: float) -> None:
+        self._bearing = bearing % 360.0
+        self.update()
+
     def set_center(self, lat: float, lng: float, zoom: Optional[float] = None) -> None:
         self._center = unit_xy(lat, lng)
         self._has_center = True
         if zoom is not None:
             self._zoom = zoom
-        self.update()
+        self._view_moved()
 
     def center(self) -> LatLng:
         return unit_to_latlng(*self._center)
@@ -63,14 +78,18 @@ class BoundaryMap(QWidget):
     def fit_corners(self) -> None:
         if not self._corners:
             return
-        us = [unit_xy(*c) for c in self._corners]
-        xs, ys = [u[0] for u in us], [u[1] for u in us]
-        self._center = ((min(xs) + max(xs)) / 2, (min(ys) + max(ys)) / 2)
+        turned = [rotate(*unit_xy(*c), self._bearing) for c in self._corners]
+        xs, ys = [t[0] for t in turned], [t[1] for t in turned]
+        self._center = unrotate((min(xs) + max(xs)) / 2, (min(ys) + max(ys)) / 2, self._bearing)
         span = max(max(xs) - min(xs), max(ys) - min(ys), 1e-9)
         fit_px = 0.75 * min(self.width(), self.height())
         self._zoom = max(MIN_ZOOM, min(math.log2(fit_px / (span * TILE_SIZE)), MAX_ZOOM + 1))
         self._has_center = True
+        self._view_moved()
+
+    def _view_moved(self) -> None:
         self.update()
+        self.view_changed.emit(*self.center())
 
     def _world(self) -> float:
         return TILE_SIZE * 2 ** self._zoom
@@ -78,13 +97,28 @@ class BoundaryMap(QWidget):
     def to_px(self, lat: float, lng: float) -> QPointF:
         ux, uy = unit_xy(lat, lng)
         world = self._world()
-        return QPointF(self.width() / 2 + (ux - self._center[0]) * world,
-                       self.height() / 2 + (uy - self._center[1]) * world)
+        x, y = rotate((ux - self._center[0]) * world, (uy - self._center[1]) * world,
+                      self._bearing)
+        return QPointF(self.width() / 2 + x, self.height() / 2 + y)
 
     def to_latlng(self, p: QPointF) -> LatLng:
         world = self._world()
-        return unit_to_latlng(self._center[0] + (p.x() - self.width() / 2) / world,
-                              self._center[1] + (p.y() - self.height() / 2) / world)
+        x, y = self._north_up_offset(p)
+        return unit_to_latlng(self._center[0] + x / world, self._center[1] + y / world)
+
+    def _north_up_offset(self, p: QPointF):
+        """Pixel offset of ``p`` from the centre on the north-up map."""
+        return unrotate(p.x() - self.width() / 2, p.y() - self.height() / 2, self._bearing)
+
+    def _turned(self, p: QPainter) -> None:
+        """Make ``p`` draw north-up pixels onto the turned map."""
+        p.translate(self.width() / 2, self.height() / 2)
+        p.rotate(-self._bearing)
+        p.translate(-self.width() / 2, -self.height() / 2)
+
+    def _cover(self) -> float:
+        """Half-side of the north-up square that covers the turned widget."""
+        return math.hypot(self.width(), self.height()) / 2
 
     # ---------- corners ----------
     def set_corners(self, corners) -> None:
@@ -118,6 +152,14 @@ class BoundaryMap(QWidget):
     # ---------- mouse ----------
     def mousePressEvent(self, e):
         p = QPointF(e.pos())
+        if e.button() == Qt.LeftButton and self._has_center and on_compass(p, self.width()):
+            self.set_bearing(0.0)               # back to north-up
+            return
+        if e.button() == Qt.LeftButton and e.modifiers() & Qt.ShiftModifier and self._has_center:
+            self._press = p
+            self._rotating = True
+            self.setCursor(Qt.SizeAllCursor)
+            return
         pin = self._pin_at(p)
         if e.button() == Qt.RightButton and pin is not None:
             del self._corners[pin]
@@ -135,10 +177,19 @@ class BoundaryMap(QWidget):
         p = QPointF(e.pos())
         if self._press is None:
             hover = self._pin_at(p)
-            if hover != self._hover_pin:
+            compass = self._has_center and on_compass(p, self.width())
+            if hover != self._hover_pin or compass != self._compass_hover:
                 self._hover_pin = hover
-                self.setCursor(Qt.SizeAllCursor if hover is not None else Qt.CrossCursor)
+                self._compass_hover = compass
+                self.setCursor(Qt.PointingHandCursor if compass else
+                               Qt.SizeAllCursor if hover is not None else Qt.CrossCursor)
                 self.update()
+            return
+        if self._rotating:
+            center = QPointF(self.width() / 2, self.height() / 2)
+            self._bearing = drag_bearing(self._bearing, center, self._press, p)
+            self._press = p
+            self.update()
             return
         if self._dragging_pin is not None:
             self._corners[self._dragging_pin] = self.to_latlng(p)
@@ -149,14 +200,20 @@ class BoundaryMap(QWidget):
             self._panning = True
             self.setCursor(Qt.ClosedHandCursor)
             world = self._world()
-            self._center = (self._center[0] - moved.x() / world, self._center[1] - moved.y() / world)
+            dx, dy = unrotate(moved.x(), moved.y(), self._bearing)
+            self._center = (self._center[0] - dx / world, self._center[1] - dy / world)
             self._press = p
-            self.update()
+            self._view_moved()
 
     def mouseReleaseEvent(self, e):
         if e.button() != Qt.LeftButton or self._press is None:
             return
         p = QPointF(e.pos())
+        if self._rotating:
+            self._rotating = False
+            self._press = None
+            self.setCursor(Qt.CrossCursor)
+            return
         if self._dragging_pin is not None:
             self._emit()
         elif not self._panning:
@@ -174,14 +231,16 @@ class BoundaryMap(QWidget):
         self.update()
 
     def wheelEvent(self, e):
+        if not self._has_center:
+            return
         p = QPointF(e.pos())
         before = self.to_latlng(p)
         self._zoom = max(MIN_ZOOM, min(self._zoom + e.angleDelta().y() / 480.0, MAX_ZOOM + 1))
         bx, by = unit_xy(*before)
         world = self._world()
-        self._center = (bx - (p.x() - self.width() / 2) / world,
-                        by - (p.y() - self.height() / 2) / world)
-        self.update()
+        x, y = self._north_up_offset(p)
+        self._center = (bx - x / world, by - y / world)
+        self._view_moved()
 
     # ---------- painting ----------
     def paintEvent(self, event):
@@ -193,8 +252,7 @@ class BoundaryMap(QWidget):
         p.setClipPath(clip)
         p.fillRect(self.rect(), theme.qcolor(theme.MAP_WATER))
         if not self._has_center:
-            _draw_note(p, QRectF(self.rect()), "Enter a centre point and press Go to",
-                       "the map opens there; then click to pin each corner")
+            _draw_note(p, QRectF(self.rect()), "Enter a centre and press Go", "")
             return
         drew_tiles = self._draw_tiles(p)
         if not drew_tiles:
@@ -203,43 +261,55 @@ class BoundaryMap(QWidget):
         self._draw_center_mark(p)
         self._draw_scale(p)
         self._draw_hint(p, drew_tiles)
+        draw_compass(p, self.width(), self._bearing, self._compass_hover)
 
     def _draw_tiles(self, p: QPainter) -> bool:
         z = int(max(0, min(MAX_ZOOM, round(self._zoom))))
         n = 1 << z
         size = TILE_SIZE * 2 ** (self._zoom - z)
         world = self._world()
-        left = self._center[0] - self.width() / 2 / world
-        top = self._center[1] - self.height() / 2 / world
+        cover = self._cover()
+        left = self._center[0] - cover / world          # north-up square around the centre
+        top = self._center[1] - cover / world
         x0, y0 = math.floor(left * n), max(0, math.floor(top * n))
-        x1 = math.floor((left + self.width() / world) * n)
-        y1 = min(n - 1, math.floor((top + self.height() / world) * n))
+        x1 = math.floor((left + 2 * cover / world) * n)
+        y1 = min(n - 1, math.floor((top + 2 * cover / world) * n))
+        ox, oy = self.width() / 2 - cover, self.height() / 2 - cover
         drew = False
+        p.save()
+        self._turned(p)
         for tx in range(x0, x1 + 1):
             for ty in range(y0, y1 + 1):
                 pix = self._tiles.tile(z, tx, ty)
                 if pix is None:
                     continue
-                px = (tx / n - left) * world
-                py = (ty / n - top) * world
+                px = ox + (tx / n - left) * world
+                py = oy + (ty / n - top) * world
                 p.drawPixmap(QRectF(px, py, size + 0.5, size + 0.5), pix, QRectF(pix.rect()))
                 drew = True
+        p.restore()
         if drew:
-            p.fillRect(self.rect(), theme.qcolor(theme.BG, 40))     # keep overlays readable
+            p.fillRect(self.rect(), theme.qcolor(theme.MAP_DIM, 40))     # keep overlays readable
         return drew
 
     def _draw_grid(self, p: QPainter) -> None:
         mpp = metres_per_pixel(self.center()[0], self._zoom)
         px_step = _scale_step(mpp) / mpp
+        cover = self._cover()
+        x0, x1 = self.width() / 2 - cover, self.width() / 2 + cover
+        y0, y1 = self.height() / 2 - cover, self.height() / 2 + cover
+        p.save()
+        self._turned(p)
         p.setPen(QPen(theme.qcolor(theme.MAP_GRID), 1))
-        x = self.width() / 2 % px_step
-        while x < self.width():
-            p.drawLine(QPointF(x, 0), QPointF(x, self.height()))
+        x = self.width() / 2 - math.floor(cover / px_step) * px_step
+        while x < x1:
+            p.drawLine(QPointF(x, y0), QPointF(x, y1))
             x += px_step
-        y = self.height() / 2 % px_step
-        while y < self.height():
-            p.drawLine(QPointF(0, y), QPointF(self.width(), y))
+        y = self.height() / 2 - math.floor(cover / px_step) * px_step
+        while y < y1:
+            p.drawLine(QPointF(x0, y), QPointF(x1, y))
             y += px_step
+        p.restore()
 
     def _draw_ring(self, p: QPainter) -> None:
         if not self._corners:
@@ -258,7 +328,7 @@ class BoundaryMap(QWidget):
             p.setPen(QPen(theme.qcolor(theme.BG), 2))
             p.setBrush(QBrush(theme.qcolor(theme.MAP_PIN)))
             p.drawEllipse(q, r, r)
-            p.setPen(theme.qcolor(theme.BG))
+            p.setPen(theme.qcolor(theme.MAP_DIM))
             p.drawText(QRectF(q.x() - r, q.y() - r, 2 * r, 2 * r), Qt.AlignCenter, str(i + 1))
 
     def _draw_center_mark(self, p: QPainter) -> None:
@@ -282,10 +352,9 @@ class BoundaryMap(QWidget):
                    Qt.AlignRight | Qt.AlignVCenter, ATTRIBUTION)
 
     def _draw_hint(self, p: QPainter, drew_tiles: bool) -> None:
-        text = ("Click: add corner · on an edge: insert · drag pin: move · "
-                "right-click pin: delete · wheel: zoom")
-        if not drew_tiles:
-            text = "No imagery (offline, not cached yet) · " + text
+        if drew_tiles:
+            return
+        text = "No imagery (offline)"
         p.setFont(theme.ui_font(8, 600))
         width = min(self.width() - 20.0, p.fontMetrics().horizontalAdvance(text) + 20.0)
         r = QRectF(10, 10, width, 22)

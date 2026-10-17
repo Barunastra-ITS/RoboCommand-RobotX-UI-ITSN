@@ -1,8 +1,11 @@
 """Shared building blocks: titled panel and status chip (OCS monitor style)."""
 
-from PyQt5.QtWidgets import QFrame, QHBoxLayout, QLabel, QVBoxLayout, QWidget
+from PyQt5.QtWidgets import QFrame, QHBoxLayout, QLabel, QSizePolicy, QVBoxLayout, QWidget
 
 from robocommand_ui import theme
+
+
+CHIP_SLACK_PX = 26
 
 
 class Panel(QFrame):
@@ -52,12 +55,13 @@ class Panel(QFrame):
         self.meta_label.setText(text)
 
     def set_dot(self, color: str) -> None:
-        self.dot_label.setStyleSheet(f"color: {color};")
+        self.dot_label.setStyleSheet(f"color: {theme.resolve(color)};")
 
 
 def make_chip(text: str = "", color: str = theme.TEXT_MUTED) -> QLabel:
     chip = QLabel(text)
     chip.setProperty("chip", True)
+    chip.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)     # pill-sized in any row
     set_chip(chip, text, color)
     return chip
 
@@ -66,3 +70,7 @@ def set_chip(chip: QLabel, text: str, color: str) -> None:
     """Solid chip for ok / warn / fault, outlined in ``color`` otherwise."""
     chip.setText(text)
     chip.setStyleSheet(theme.chip_style(color))
+    # Fallback-font glyphs (●) can outrun the size hint: measure with the chip's own
+    # (polished, 11 px bold) font and leave room for its padding and border
+    chip.ensurePolished()
+    chip.setMinimumWidth(chip.fontMetrics().horizontalAdvance(text) + CHIP_SLACK_PX)

@@ -16,6 +16,7 @@ from robocommand_ui.course_presets import (
 from robocommand_ui.course_validation import validate_course
 from robocommand_ui.incident_log import IncidentLog
 from robocommand_ui.run_log import RunRecorder
+from robocommand_ui.run_replay import list_runs, load_run
 from robocommand_ui.proto_helper import rx_commands_pb2, rx_common_pb2, rx_reports_pb2
 
 TEAM = "ITSN"
@@ -259,6 +260,60 @@ class TestRunRecorder(unittest.TestCase):
         log.record("RNRX", 1, "all_clear", "")
         log.clear_team(TEAM)
         self.assertEqual([e.team_id for e in log.entries()], ["RNRX"])
+
+
+class TestRunReplay(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self.tmp.name) / "runs"
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _record(self, team=TEAM, run_id=7, start=1000.0):
+        rec = RunRecorder(self.dir)
+        ring = [(1.0, 2.0), (1.0, 2.1), (1.1, 2.1), (1.0, 2.0)]
+        rec.begin(team, run_id, 3, now=start, course=(ring, "alpha"),
+                  geofence=[(1.0, 2.0), (1.0, 2.05), (1.05, 2.05)])
+        hb = rx_reports_pb2.Heartbeat(vehicle_type=rx_common_pb2.TYPE_USV, heading_deg=90,
+                                      state=3)
+        for i in range(5):
+            hb.position.latitude, hb.position.longitude = 1.0 + i * 0.01, 2.0
+            rec.track(team, "USV1", hb, now=start + i)
+        rec.task(team, "pipeline", ((1.02, 2.0), [1, 2]), now=start + 2)
+        return rec.finish(team, "ended by host", [], now=start + 10)
+
+    def test_finished_run_is_listed_with_its_replay(self):
+        self._record()
+        runs = list_runs(self.dir)
+        self.assertEqual([(r.team_id, r.run_id) for r in runs], [(TEAM, 7)])
+        self.assertEqual(runs[0].duration, 10.0)
+        self.assertTrue(runs[0].log_path.name.endswith("_run7.log"))
+
+    def test_runs_are_newest_first_and_bad_files_are_skipped(self):
+        self._record(run_id=1, start=1000.0)
+        self._record(run_id=2, start=5000.0)
+        (self.dir / "broken.json").write_text("{not json")
+        self.assertEqual([r.run_id for r in list_runs(self.dir)], [2, 1])
+
+    def test_missing_directory_lists_nothing(self):
+        self.assertEqual(list_runs(self.dir), [])
+
+    def test_frame_shows_track_up_to_the_time(self):
+        self._record()
+        replay = load_run(list_runs(self.dir)[0].replay_path)
+        self.assertEqual(replay.course_id, "alpha")
+        self.assertEqual(len(replay.geofence), 3)
+        frame = replay.frame(2.5)
+        usv = frame.vehicles["USV1"]
+        self.assertEqual(len(usv.trail), 3)
+        self.assertAlmostEqual(usv.lat, 1.02)
+        self.assertEqual(usv.heading, 90)
+        self.assertFalse(usv.stale)
+        self.assertEqual(frame.pipeline, ((1.02, 2.0), [1, 2]))
+        self.assertIsNone(replay.frame(1.0).pipeline)
+        self.assertEqual(replay.frame(-1).vehicles, {})
+        self.assertTrue(replay.frame(9.0).vehicles["USV1"].stale)    # last fix at 4 s
 
 
 if __name__ == "__main__":

@@ -4,7 +4,7 @@ Two programs for the RobotX 2026 communications protocol (Team Handbook §3.4):
 
 | Program | Runs on | Does |
 |---|---|---|
-| `run_ui.py` — **Host Console** (Qt) | The course RoboCommand host, e.g. `192.168.65.2` | Shows everything teams report (boat movement, telemetry) and sends what RoboCommand sends: course, RunStart, Task 4 |
+| `run_ui.py` — **RoboCommand** (Qt) | The course RoboCommand host, e.g. `192.168.65.2` | Shows everything teams report (boat movement, telemetry) and sends what RoboCommand sends: course, RunStart, Task 4 |
 | `report.py` — **GCS Reporter** | The team GCS/OCS | Finds the course host, connects to it, declares the run, sends 2 Hz heartbeats |
 
 ```
@@ -49,9 +49,16 @@ press a send button**. It has four tabs:
 | Tab | Does | Replaces |
 |---|---|---|
 | **Map** | Monitor: the panels below | — |
-| **Course** | Edit and publish the retained `RxCourse`. Built-in and saved presets (`~/.config/robocommand_ui/course_presets.json`), live validity, ring closed automatically, clear the retained course. **Boundary map:** type a centre lat/lng → **Go**, then click the satellite map to pin corners (click an edge to insert, drag to move, right-click to delete); the coordinate table fills itself, and edits to the table move the pins | `rc course …` |
-| **Run start** | Every team that sent a RunDeclaration; select one and press **Allow start** (declaration seq filled in from the declaration). **End run** closes an ACTIVE run on this host — the protocol has no run-end message, so nothing is sent: the run log is saved to `~/.local/share/robocommand_ui/runs/` (`$ROBOCOMMAND_RUN_LOG_DIR`) and the team shows **ENDED** until its next RunDeclaration, which appears as DECLARED. A team that declares again while ACTIVE closes its previous run log automatically | `rc run-start …` |
+| **Course** | Edit and publish the retained `RxCourse`. **Presets** list on the left: pick one to load it, **+ Add preset** saves a new one, **Update preset** overwrites the loaded one without asking a name (`~/.config/robocommand_ui/course_presets.json`). Course ID filled from the course this host serves; pinger as a number in Hz; live validity; ring closed automatically; last publish time; clear the retained course. **Boundary map:** the Centre fields follow the map as it moves (or type a centre → **Go**); click the satellite map to pin corners (click an edge to insert, drag to move, right-click to delete); the coordinate table fills itself, and edits to the table move the pins | `rc course …` |
+| **Run start** | Every team that sent a RunDeclaration; select one and press **Allow start** (declaration seq filled in from the declaration). Start is enabled only when every declared vehicle is LIVE and in AUTO; RunStart clears that team's trails and task overlays from the map. **End run** closes an ACTIVE run on this host — the protocol has no run-end message, so nothing is sent: the run log is saved to `~/.local/share/robocommand_ui/runs/` (`$ROBOCOMMAND_RUN_LOG_DIR`) and the team shows **ENDED** until its next RunDeclaration, which appears as DECLARED. A team that declares again while ACTIVE closes its previous run log automatically. **Finished runs** lists saved runs by Run ID; **Replay** redraws that run's map and vehicle movement on a timeline | `rc run-start …` |
 | **Task 4** | Core (assistance request, readiness confirm), Advanced (keep-out zone, all clear), Disruptive (moving object alert). Shows the team's declared tier and a history that matches each command with its IncidentAck / ReadinessReport; the readiness confirm fills itself in | `rc assistance-request …` etc. |
+
+The Map tab's **Clear** removes trails and task overlays by hand (RunStart does it per team).
+**Light / Dark mode** (tab bar, right) switches the theme; light is the default and is remembered.
+
+Team GCSs get their address from this host: `sudo ./scripts/dhcp/install_dhcp.sh` serves the
+Alpha/Bravo/Charlie/Delta/Demo networks (`192.168.65–68.0/24`, demo `192.168.70.0/24` on VLAN 70); to change course, change only the
+wired IP to that course's `.2`.
 
 Both maps use the same satellite imagery as the nala2-report OCS (Esri World Imagery), cached in
 `~/.cache/robocommand_ui/tiles`. Course networks have no Internet, so open the Course tab over the
