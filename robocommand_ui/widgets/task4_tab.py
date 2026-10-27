@@ -3,11 +3,21 @@
 Replaces ``rc assistance-request`` / ``readiness-confirm`` (Core),
 ``keep-out-zone`` / ``all-clear`` (Advanced) and ``moving-object-alert``
 (Disruptive). Every command goes to the selected team with the next seq.
-Only the panel of the team's declared Task 4 tier can send: each tier has its
-own command chain (§3.4.12), so a team that declared Advanced gets keep-out
-zones and all-clears, not assistance requests or moving objects.
+Every panel can be edited, but only the send buttons of the team's declared
+Task 4 tier work: each tier has its own command chain (§3.4.12), so a team
+that declared Advanced gets keep-out zones and all-clears, not assistance
+requests or moving objects.
 The history below matches each command with the team's IncidentAck and
 ReadinessReport, and fills in the Readiness confirm for you.
+
+The **Incident map** beside it shows the course, the team's vehicles and the
+objects it reported. Its centre crosshair is where commands go: pan the map
+and the position fields of every tier follow it (typing a position, or
+**Centre**, moves the map there). Each tier's command is drawn as it would be
+sent (the declared tier's labelled, the others faint): the assistance point,
+the keep-out zone at its radius (dashed red), and the moving object with its
+keep-out radius (dashed yellow) and heading; when the two rings fall on the
+same line (same place and radius), it alternates red and yellow dashes.
 """
 
 import time
@@ -24,9 +34,11 @@ from robocommand_ui.fleet_state import STALE_SECONDS, FleetState
 from robocommand_ui.incident_log import IncidentLog
 from robocommand_ui.proto_helper import common_pb2, task_tier_name, vehicle_type_name
 from robocommand_ui.widgets.form import (
-    LatLngField, button, caption, heading, int_spin, number_spin, type_combo,
+    LatLngField, button, caption, heading, int_spin, number_spin, type_combo, with_unit,
 )
+from robocommand_ui.widgets.course_map import CourseMapWidget
 from robocommand_ui.widgets.panel import Panel, make_chip, set_chip
+from robocommand_ui.widgets.task4_map import IncidentMapCanvas, Preview
 
 TIER_LEVELS = (common_pb2.TIER_CORE, common_pb2.TIER_ADVANCED, common_pb2.TIER_DISRUPTIVE)
 HISTORY_COLUMNS = ["Seq", "Time", "Command", "Details", "Team answer"]
@@ -65,7 +77,12 @@ class Task4Tab(QWidget):
         for panel in self._tier_panels:
             tiers.addWidget(panel, 1)
         col.addLayout(tiers)
-        col.addWidget(self._build_history(), 1)
+        bottom = QHBoxLayout()
+        bottom.setSpacing(16)
+        bottom.addWidget(self._build_history(), 2)
+        bottom.addWidget(self._build_map(), 3)
+        col.addLayout(bottom, 1)
+        self._connect_previews()
         self._sync_buttons()
 
     # ---------- builders ----------
@@ -93,10 +110,11 @@ class Task4Tab(QWidget):
         row.addWidget(self.seq_label)
         return row
 
-    def _send_button(self, text: str, handler) -> QWidget:
+    def _send_button(self, text: str, handler, level: int) -> QWidget:
+        """A send button of one tier: it works only when that tier is the declared one."""
         btn = button(text, "Primary")
         btn.clicked.connect(handler)
-        self._send_buttons.append(btn)
+        self._send_buttons.append((btn, level))
         return btn
 
     def _build_core(self) -> Panel:
@@ -108,7 +126,8 @@ class Task4Tab(QWidget):
         self.assist_pos = LatLngField()
         form.addRow("Go to", self.assist_pos)
         panel.body.addLayout(form)
-        panel.body.addWidget(self._send_button("Send assistance request", self._send_assist))
+        panel.body.addWidget(self._send_button("Send assistance request", self._send_assist,
+                                                common_pb2.TIER_CORE))
 
         panel.body.addWidget(heading("Readiness confirm"))
         form = _form()
@@ -121,7 +140,8 @@ class Task4Tab(QWidget):
         panel.body.addLayout(form)
         self.confirm_hint = caption("")
         panel.body.addWidget(self.confirm_hint)
-        panel.body.addWidget(self._send_button("Send readiness confirm", self._send_confirm))
+        panel.body.addWidget(self._send_button("Send readiness confirm", self._send_confirm,
+                                                common_pb2.TIER_CORE))
         panel.body.addStretch()
         return panel
 
@@ -133,17 +153,19 @@ class Task4Tab(QWidget):
         form.addRow("Vehicle type", self.koz_type)
         self.koz_pos = LatLngField()
         form.addRow("Centre", self.koz_pos)
-        self.koz_radius = number_spin(1.0, 500.0, 15.0, 1, " m")
-        form.addRow("Radius", self.koz_radius)
+        self.koz_radius = number_spin(1.0, 500.0, 15.0, 1)
+        form.addRow("Radius", with_unit(self.koz_radius, "m"))
         panel.body.addLayout(form)
-        panel.body.addWidget(self._send_button("Send keep-out zone", self._send_koz))
+        panel.body.addWidget(self._send_button("Send keep-out zone", self._send_koz,
+                                                common_pb2.TIER_ADVANCED))
 
         panel.body.addWidget(heading("All clear"))
         form = _form()
         self.clear_type = type_combo()
         form.addRow("Vehicle type", self.clear_type)
         panel.body.addLayout(form)
-        panel.body.addWidget(self._send_button("Send all clear", self._send_all_clear))
+        panel.body.addWidget(self._send_button("Send all clear", self._send_all_clear,
+                                                common_pb2.TIER_ADVANCED))
         panel.body.addStretch()
         return panel
 
@@ -153,11 +175,15 @@ class Task4Tab(QWidget):
         form = _form()
         self.mo_pos = LatLngField()
         form.addRow("Object at", self.mo_pos)
-        self.mo_heading = number_spin(0.0, 359.9, 0.0, 1, " °")
+        self.mo_heading = number_spin(0.0, 359.9, 0.0, 1)
         self.mo_heading.setWrapping(True)
-        form.addRow("Heading", self.mo_heading)
-        self.mo_speed = number_spin(0.0, 20.0, 1.0, 2, " m/s")
-        form.addRow("Speed", self.mo_speed)
+        form.addRow("Heading", with_unit(self.mo_heading, "°"))
+        self.mo_speed = number_spin(0.0, 20.0, 1.0, 2)
+        form.addRow("Speed", with_unit(self.mo_speed, "m/s"))
+        self.mo_radius = number_spin(0.5, 100.0, commands.DEFAULT_MOVING_KEEP_OUT_M, 1)
+        self.mo_radius.setToolTip("Keep-out radius: affected vehicles must stay beyond this "
+                                  "distance from the object (MovingObjectAlert.keep_out_radius_m)")
+        form.addRow("Keep out", with_unit(self.mo_radius, "m"))
         affected = QHBoxLayout()
         affected.setSpacing(16)
         self.mo_types = {}
@@ -170,7 +196,8 @@ class Task4Tab(QWidget):
         affected.addStretch()
         form.addRow("Affects", affected)
         panel.body.addLayout(form)
-        panel.body.addWidget(self._send_button("Send moving object alert", self._send_moving))
+        panel.body.addWidget(self._send_button("Send moving object alert", self._send_moving,
+                                                common_pb2.TIER_DISRUPTIVE))
         panel.body.addStretch()
         return panel
 
@@ -190,14 +217,73 @@ class Task4Tab(QWidget):
         panel.body.addWidget(self.history)
         return panel
 
+    def _build_map(self) -> CourseMapWidget:
+        self.map = IncidentMapCanvas()
+        self.map_panel = CourseMapWidget(title="Incident map", canvas=self.map, clearable=False)
+        self.map_panel.set_meta("pan to place · crosshair = position")
+        self.map.center_changed.connect(self._on_map_center)
+        return self.map_panel
+
+    def _connect_previews(self) -> None:
+        for field in self._position_fields():
+            field.edited.connect(self._on_field_edited)
+        for spin in (self.koz_radius, self.mo_radius, self.mo_heading, self.mo_speed):
+            spin.valueChanged.connect(self._update_previews)
+        for combo in (self.assist_type, self.koz_type):
+            combo.currentTextChanged.connect(self._update_previews)
+        for box in self.mo_types.values():
+            box.toggled.connect(self._update_previews)
+
+    def _position_fields(self):
+        return (self.assist_pos, self.koz_pos, self.mo_pos)
+
+    # ---------- map ----------
+    def _on_map_center(self, lat: float, lng: float) -> None:
+        """The map was panned: every tier's position follows its centre."""
+        for field in self._position_fields():
+            field.follow((lat, lng))
+        self._update_previews()
+
+    def _on_field_edited(self, lat: float, lng: float) -> None:
+        """A position was typed (or set to the course centre): bring the map there."""
+        self.map.set_center_latlng(lat, lng)
+        self._update_previews()
+
+    def previews(self):
+        """Every tier's command as it would be sent; the declared tier's (or all, when
+        none is declared) active, the others faint."""
+        declared = self._declared_tier if self._declared_tier in TIER_LEVELS else None
+        mo_radius, koz_radius = self.mo_radius.value(), self.koz_radius.value()
+        types = "/".join(n for n, box in self.mo_types.items() if box.isChecked()) or "none"
+        out = [
+            Preview(self.assist_pos.value(), f"ASSIST {self.assist_type.currentText()}",
+                    theme.INFO, active=declared in (None, common_pb2.TIER_CORE)),
+            Preview(self.koz_pos.value(), f"KEEP-OUT {koz_radius:g} m · {self.koz_type.currentText()}",
+                    theme.FAULT, radius_m=koz_radius,
+                    active=declared in (None, common_pb2.TIER_ADVANCED)),
+            Preview(self.mo_pos.value(), f"MOVING · {mo_radius:g} m · {types}", theme.WARN,
+                    radius_m=mo_radius, heading_deg=self.mo_heading.value(),
+                    speed_mps=self.mo_speed.value(),
+                    active=declared in (None, common_pb2.TIER_DISRUPTIVE)),
+        ]
+        return out
+
+    def _update_previews(self, *_args) -> None:
+        if hasattr(self, "map"):
+            self.map.set_previews(self.previews())
+
     # ---------- inputs from the window ----------
     def set_connected(self, connected: bool) -> None:
         self._connected = connected
         self._sync_buttons()
 
-    def set_course(self, ring, center) -> None:
-        for field in (self.assist_pos, self.koz_pos, self.mo_pos):
+    def set_course(self, ring, center, course=None) -> None:
+        """Course boundary for the position fields; ``course`` (RxCourse) for the map."""
+        for field in self._position_fields():
             field.set_course(ring, center)
+        if course is not None:
+            self.map_panel.set_course(course)
+        self._update_previews()
 
     def selected_team(self) -> Optional[str]:
         return self.team_combo.currentText() or None
@@ -212,6 +298,7 @@ class Task4Tab(QWidget):
         self.seq_label.setText(f"next seq {next_seq(team_id)}" if team_id else "")
         self._fill_readiness(incidents, team_id)
         self._show_history(incidents, team_id)
+        self.map_panel.show_fleet(fleet, team_id, now)
 
     def _sync_teams(self, fleet: FleetState) -> None:
         teams = fleet.team_ids()
@@ -293,18 +380,24 @@ class Task4Tab(QWidget):
                 self.history.setItem(row, col, item)
 
     def _sync_buttons(self) -> None:
-        """Send buttons work only when connected, and only in the declared tier's panel."""
-        enabled = self._connected and bool(self.selected_team())
-        tip = "" if enabled else ("Connect to the broker first" if not self._connected
-                                  else "No team selected")
-        for btn in self._send_buttons:
-            btn.setEnabled(enabled)
-            btn.setStatusTip(tip)
-        for panel, level in zip(self._tier_panels, TIER_LEVELS):
-            allowed = self._declared_tier == level
-            panel.setEnabled(allowed)
-            panel.setToolTip("" if allowed else
-                             "Not this team's declared Task 4 tier (or its declaration was not seen)")
+        """Every panel stays editable; send buttons work only when connected, for the
+        declared tier."""
+        for btn, level in self._send_buttons:
+            reason = self._send_blocked(level)
+            btn.setEnabled(not reason)
+            btn.setToolTip(reason)
+            btn.setStatusTip(reason)
+        self._update_previews()
+
+    def _send_blocked(self, level: int) -> str:
+        """Why a send button of this tier can't send; empty when it can."""
+        if not self._connected:
+            return "Connect to the broker first"
+        if not self.selected_team():
+            return "No team selected"
+        if self._declared_tier != level:
+            return "Not this team's declared Task 4 tier (or its declaration was not seen)"
+        return ""
 
     # ---------- senders ----------
     def _emit(self, body, summary: str) -> None:
@@ -315,7 +408,7 @@ class Task4Tab(QWidget):
     @staticmethod
     def _where(field: LatLngField) -> str:
         lat, lng = field.value()
-        return f"{lat:.7f}, {lng:.7f}"
+        return f"{lat:.9f}, {lng:.9f}"
 
     def _send_assist(self) -> None:
         vtype = self.assist_type.currentText()
@@ -343,6 +436,8 @@ class Task4Tab(QWidget):
             self.mo_types["USV"].setFocus()
             return
         heading_deg, speed = self.mo_heading.value(), self.mo_speed.value()
-        self._emit(commands.moving_object_alert(self.mo_pos.value(), heading_deg, speed, types),
-                   f"{'/'.join(types)} · {heading_deg:.0f}° {speed:.1f} m/s at "
+        radius = self.mo_radius.value()
+        self._emit(commands.moving_object_alert(self.mo_pos.value(), heading_deg, speed, types,
+                                                radius),
+                   f"{'/'.join(types)} · {heading_deg:.0f}° {speed:.1f} m/s r={radius:.1f} m at "
                    f"{self._where(self.mo_pos)}")

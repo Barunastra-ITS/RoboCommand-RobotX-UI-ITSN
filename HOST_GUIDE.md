@@ -255,6 +255,9 @@ python3.10 report.py --course local --team ITSN --vehicle USV1 --vehicle UUV1 --
 | `--vehicle` | required, repeatable | `USV1` or `ID:TYPE` (`boat1:USV`) |
 | `--tiers` | `NONE,NONE,NONE,NONE` | Task 1–4 tiers |
 | `--geofence` | — | `"lat,lng;lat,lng;…"`, required when a UAV is declared |
+| `--uav-ceiling` | `40` | UAV geofence max altitude, meters HAE (above 0, at most 50) |
+| `--uav-pilot-callsign` | — | UAV pilot's MyDroneFleets call sign (first name + UAPL number) |
+| `--uav-registration` | — | UAV CAAS registration number, sent in its heartbeats |
 | `--simulate` | off | Orbit the course centre; otherwise read JSON telemetry lines on stdin |
 
 ---
@@ -269,7 +272,7 @@ GCS answers with reports. Section 3.5 lists the options; this section is the ord
 | Check | Where |
 |---|---|
 | Team is `ACTIVE · RUN n` | Header chip / teams panel. Don't send Task 4 to a team that is only DECLARED |
-| Declared Task 4 tier | Tier column in the teams panel. Each tier has its **own** chain — Core: assistance request + readiness confirm; Advanced: keep-out zone + all clear; Disruptive: moving object alert. The Task 4 tab enables only the declared tier's panel |
+| Declared Task 4 tier | Tier column in the teams panel. Each tier has its **own** chain — Core: assistance request + readiness confirm; Advanced: keep-out zone + all clear; Disruptive: moving object alert. On the Task 4 tab every panel can be edited, but only the declared tier's send buttons work |
 | Vehicle of the targeted type is LIVE | Vehicle cards. Commands are addressed by **vehicle type**, not ID |
 | Positions are inside the course | Pick `--lat/--lng` inside the course boundary on the map (the 3.5 defaults are in Singapore) |
 
@@ -449,6 +452,7 @@ ros2 service call /nala2_report/new_run std_srvs/srv/Trigger
 | Map says *Waiting for RxCourse* | No retained course: Course tab → **Publish course** |
 | Course chip red `INVALID` | First and last corner differ, a corner out of range, or pinger 0 |
 | Team stuck `DECLARED` | Run start tab → select the team → **Allow start** |
+| **Allow start** disabled with "RoboCommand would refuse the declaration" | The team's UAV geofence leaves the course and UAV transit area, or its ceiling isn't above 0 and at most 50 m HAE. The real RoboCommand silently refuses such a declaration; the team must fix it and declare again. If the geofence covers takeoff/landing outside the course, publish the course with its UAV transit area (Course tab → **UAV transit**) |
 | `NO HEARTBEAT` | GCS declared but vehicles aren't publishing `/system/vehicle/*/heartbeat` — start them or `report_inject` |
 | `LINK LOST` | GCS stopped or the cable/Wi-Fi dropped |
 | `DECL MISMATCH` | RunStart declaration seq ≠ the team's declaration seq. The GCS does **not** pass this RunStart to the boat; use **Allow start** (it takes the seq from the declaration) |

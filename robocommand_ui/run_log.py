@@ -20,7 +20,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 LatLng = Tuple[float, float]
 REPLAY_VERSION = 1
-COORD_DECIMALS = 7          # ~1 cm
+COORD_DECIMALS = 9          # as the course and Task 4 fields
 
 
 def default_dir() -> Path:

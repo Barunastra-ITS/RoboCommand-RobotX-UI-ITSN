@@ -20,7 +20,7 @@ from robocommand_ui import field_devices, theme
 from robocommand_ui.field_devices import ALL_BAYS, BayStatus, DockStatus
 from robocommand_ui.widgets.device_host import DeviceHost, readout_style
 from robocommand_ui.widgets.device_runner import DeviceRunner
-from robocommand_ui.widgets.form import button, caption, heading, number_spin
+from robocommand_ui.widgets.form import button, caption, heading, number_spin, unit_label
 from robocommand_ui.widgets.panel import Panel, make_chip, set_chip
 
 POLL_MS = 1000
@@ -218,7 +218,7 @@ class Task3Tab(QWidget):
         self.target_spin.setSingleStep(TARGET_STEP_L)
         self.target_spin.valueChanged.connect(self._show_target)
         row.addWidget(self.target_spin)
-        row.addWidget(QLabel("L"))
+        row.addWidget(unit_label("L"))
         self.target_btn = button("Set", "Ghost", "Litres each bay must collect (lost on ESP reboot)")
         self.target_btn.clicked.connect(self._set_target)
         row.addWidget(self.target_btn)
@@ -227,6 +227,7 @@ class Task3Tab(QWidget):
         self.calib_spin = number_spin(0.1, 1000.0, DEFAULT_CALIBRATION, 2)
         self.calib_spin.setToolTip("Sensor pulses per (L/min); the ESP keeps it across reboots")
         row.addWidget(self.calib_spin)
+        row.addWidget(unit_label("pulses/(L/min)"))
         self.calib_btn = button("Save", "Ghost", "Store the calibration on the ESP")
         self.calib_btn.clicked.connect(
             lambda: self.send(f"Flow calibration {self.calib_spin.value():.2f}",

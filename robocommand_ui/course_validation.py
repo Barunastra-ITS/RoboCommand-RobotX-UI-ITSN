@@ -30,8 +30,26 @@ def validate_course(course):
         if first.latitude != last.latitude or first.longitude != last.longitude:
             issues.append(
                 "boundary is not a closed polygon "
-                f"(first corner {first.latitude:.7f},{first.longitude:.7f} "
-                f"!= last corner {last.latitude:.7f},{last.longitude:.7f})"
+                f"(first corner {first.latitude:.9f},{first.longitude:.9f} "
+                f"!= last corner {last.latitude:.9f},{last.longitude:.9f})"
             )
 
+    issues.extend(_transit_issues(course.uav_transit_area))
+    return issues
+
+
+def _transit_issues(area):
+    """uav_transit_area is optional; when given it is closed like the corners."""
+    if not area:
+        return []
+    issues = []
+    if len(area) < 4:
+        issues.append(f"UAV transit area has only {len(area)} point(s) "
+                      f"(need >= 3 corners, closed)")
+    for i, c in enumerate(area):
+        if not (-90.0 <= c.latitude <= 90.0) or not (-180.0 <= c.longitude <= 180.0):
+            issues.append(f"UAV transit point {i + 1} out of range")
+    first, last = area[0], area[-1]
+    if first.latitude != last.latitude or first.longitude != last.longitude:
+        issues.append("UAV transit area is not a closed polygon")
     return issues

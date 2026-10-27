@@ -5,6 +5,10 @@ pin to move it, right-click a pin to delete it. Wheel zooms about the
 cursor, drag on empty map pans, Shift+drag turns the map and the compass
 (top right) turns it back to north-up. Every change emits ``corners_changed`` with
 the open ring (the Course tab closes it on publish).
+
+One ring is edited at a time; ``set_backdrop`` draws another (the course
+boundary while the UAV transit area is edited, or the other way round) as a
+dashed outline that can't be dragged.
 """
 
 import math
@@ -45,6 +49,7 @@ class BoundaryMap(QWidget):
         self._center = unit_xy(0.0, 0.0)        # unit coords at widget centre
         self._zoom = DEFAULT_ZOOM
         self._corners: List[LatLng] = []
+        self._backdrop: List[LatLng] = []      # the ring not being edited, outline only
         self._press: Optional[QPointF] = None
         self._dragging_pin: Optional[int] = None
         self._panning = False
@@ -76,9 +81,10 @@ class BoundaryMap(QWidget):
         return self._zoom
 
     def fit_corners(self) -> None:
-        if not self._corners:
+        points = self._corners + self._backdrop
+        if not points:
             return
-        turned = [rotate(*unit_xy(*c), self._bearing) for c in self._corners]
+        turned = [rotate(*unit_xy(*c), self._bearing) for c in points]
         xs, ys = [t[0] for t in turned], [t[1] for t in turned]
         self._center = unrotate((min(xs) + max(xs)) / 2, (min(ys) + max(ys)) / 2, self._bearing)
         span = max(max(xs) - min(xs), max(ys) - min(ys), 1e-9)
@@ -127,6 +133,13 @@ class BoundaryMap(QWidget):
 
     def corners(self) -> List[LatLng]:
         return list(self._corners)
+
+    def set_backdrop(self, ring) -> None:
+        self._backdrop = [tuple(c) for c in ring]
+        self.update()
+
+    def backdrop(self) -> List[LatLng]:
+        return list(self._backdrop)
 
     def _emit(self) -> None:
         self.corners_changed.emit(list(self._corners))
@@ -257,6 +270,7 @@ class BoundaryMap(QWidget):
         drew_tiles = self._draw_tiles(p)
         if not drew_tiles:
             self._draw_grid(p)
+        self._draw_backdrop(p)
         self._draw_ring(p)
         self._draw_center_mark(p)
         self._draw_scale(p)
@@ -310,6 +324,19 @@ class BoundaryMap(QWidget):
             p.drawLine(QPointF(x0, y), QPointF(x1, y))
             y += px_step
         p.restore()
+
+    def _draw_backdrop(self, p: QPainter) -> None:
+        if len(self._backdrop) < 2:
+            return
+        poly = QPolygonF([self.to_px(*c) for c in self._backdrop])
+        p.setBrush(QBrush(theme.qcolor(theme.MAP_BOUNDARY, 22)))
+        p.setPen(QPen(theme.qcolor(theme.MAP_DIM, 140), 3.4))     # halo: readable on any ground
+        p.drawPolygon(poly)
+        pen = QPen(theme.qcolor(theme.MAP_BOUNDARY, 230), 1.6, Qt.DashLine)
+        pen.setDashPattern([6, 4])
+        p.setBrush(Qt.NoBrush)
+        p.setPen(pen)
+        p.drawPolygon(poly)
 
     def _draw_ring(self, p: QPainter) -> None:
         if not self._corners:

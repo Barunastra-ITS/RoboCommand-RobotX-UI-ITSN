@@ -2,7 +2,7 @@
 
 from typing import Optional, Sequence, Tuple
 
-from PyQt5.QtCore import Qt
+from PyQt5.QtCore import Qt, pyqtSignal
 from PyQt5.QtWidgets import (
     QComboBox, QDoubleSpinBox, QHBoxLayout, QLabel, QPushButton, QSpinBox, QVBoxLayout, QWidget,
 )
@@ -11,7 +11,8 @@ from robocommand_ui import theme
 from robocommand_ui.commands import VEHICLE_TYPES, point_in_polygon
 
 LatLng = Tuple[float, float]
-COORD_DECIMALS = 7          # ~1 cm, the precision RoboCommand publishes
+COORD_DECIMALS = 9          # ~0.1 mm: keeps the 9 decimals RoboCommand surveys use
+UNIT_WIDTH = 34             # px: fits "m/s" and "°" alike
 
 
 def coord_spin(limit: float) -> QDoubleSpinBox:
@@ -20,19 +21,38 @@ def coord_spin(limit: float) -> QDoubleSpinBox:
     spin.setDecimals(COORD_DECIMALS)
     spin.setSingleStep(0.00001)
     spin.setFont(theme.mono_font(9.5))
-    spin.setMinimumWidth(130)
+    spin.setMinimumWidth(150)
     return spin
 
 
-def number_spin(lo: float, hi: float, value: float, decimals: int = 1,
-                suffix: str = "") -> QDoubleSpinBox:
+def number_spin(lo: float, hi: float, value: float, decimals: int = 1) -> QDoubleSpinBox:
+    """A plain number: its unit goes beside it (``with_unit``), never inside the box,
+    so typing, pasting and copying the value never trip over the unit."""
     spin = QDoubleSpinBox()
     spin.setRange(lo, hi)
     spin.setDecimals(decimals)
     spin.setValue(value)
-    spin.setSuffix(suffix)
     spin.setFont(theme.mono_font(9.5))
     return spin
+
+
+def unit_label(unit: str) -> QLabel:
+    label = QLabel(unit)
+    label.setObjectName("Unit")
+    return label
+
+
+def with_unit(field: QWidget, unit: str) -> QWidget:
+    """``field`` with its unit as a separate label on its right."""
+    box = QWidget()
+    row = QHBoxLayout(box)
+    row.setContentsMargins(0, 0, 0, 0)
+    row.setSpacing(8)
+    row.addWidget(field, 1)
+    label = unit_label(unit)
+    label.setFixedWidth(UNIT_WIDTH)          # fields of one form line up whatever their unit
+    row.addWidget(label, 0, Qt.AlignVCenter)
+    return box
 
 
 def int_spin(lo: int, hi: int, value: int) -> QSpinBox:
@@ -78,8 +98,12 @@ class LatLngField(QWidget):
     """Latitude / longitude pair with a "course centre" shortcut.
 
     Follows the course centre until the operator edits it, and warns when the
-    point is outside the course boundary.
+    point is outside the course boundary. ``follow`` moves it with a map
+    (except while the operator is typing in it); ``edited`` reports a value the
+    operator typed or took from the course centre.
     """
+
+    edited = pyqtSignal(float, float)       # lat, lng set by the operator
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -119,6 +143,11 @@ class LatLngField(QWidget):
             spin.blockSignals(False)
         self._check()
 
+    def follow(self, point: LatLng) -> None:
+        """Take a point from the map, unless the operator is typing in this field."""
+        if not (self.lat.hasFocus() or self.lng.hasFocus()):
+            self.set_value(point)
+
     def set_course(self, ring: Sequence[LatLng], center: Optional[LatLng]) -> None:
         self._ring = list(ring)
         self._center = center
@@ -134,10 +163,12 @@ class LatLngField(QWidget):
     def _use_center(self) -> None:
         if self._center is not None:
             self.set_value(self._center)
+            self.edited.emit(*self._center)
 
     def _on_edit(self) -> None:
         self._touched = True
         self._check()
+        self.edited.emit(*self.value())
 
     def _check(self) -> None:
         inside = self.is_inside_course()

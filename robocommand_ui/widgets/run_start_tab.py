@@ -5,7 +5,9 @@ whose GCS sent a RunDeclaration is listed; pick one and press **Allow start**.
 The declaration seq comes from the declaration itself, so it always matches.
 
 Allow start stays disabled until every declared vehicle is live (fresh
-heartbeat) and in AUTO; what is missing is listed under the team.
+heartbeat) and in AUTO, and, with a UAV, the declaration passes RoboCommand's
+geofence check (within the course or UAV transit area, ceiling in (0, 50] m
+HAE); what is missing is listed under the team.
 
 **End run** closes an ACTIVE run on this host (the protocol has no run-end
 message): the run log is saved and the team shows ENDED until its GCS sends
@@ -59,7 +61,9 @@ class RunStartTab(QWidget):
         super().__init__(parent)
         self._teams = {}
         self._blockers: Dict[str, List[str]] = {}
+        self._decl_problems: Dict[str, List[str]] = {}
         self._connected = False
+        self._uav: Dict[str, bool] = {}
         self._run_id_for = None         # (team, declaration seq) the run id was suggested for
         self._run_log_dir = run_log_dir
         self._runs: List[RunSummary] = []
@@ -173,6 +177,8 @@ class RunStartTab(QWidget):
         teams = requesting_teams(fleet)
         self._teams = {t.team_id: t for t in teams}
         self._blockers = {t.team_id: fleet.start_blockers(t.team_id, now) for t in teams}
+        self._decl_problems = {t.team_id: fleet.declaration_problems(t.team_id) for t in teams}
+        self._uav = {t.team_id: fleet.declares_uav(t.team_id) for t in teams}
 
         self.table.blockSignals(True)
         self.table.setRowCount(len(teams))
@@ -234,13 +240,20 @@ class RunStartTab(QWidget):
             self.start_btn.setEnabled(False)
             return
         blockers = self._blockers.get(team_id, [])
+        problems = self._decl_problems.get(team_id, [])
         self.selected_label.setText(f"{team_id} · {state}")
         self.detail.setText(
             f"Declaration seq {team.declaration_seq}  ·  vehicles "
             f"{', '.join(team.declared_vehicles) or '—'}"
+            + (f"\nUAV pilot {team.uav_pilot_callsign or '—'}  ·  geofence "
+               f"{len(team.geofence)} points, ceiling {team.geofence_ceiling_hae_m:g} m HAE"
+               if self._uav.get(team_id) else "")
             + (f"\nNot ready: {'; '.join(blockers)}" if blockers
                else "\nAll vehicles LIVE and AUTO.")
+            + (f"\nRoboCommand would refuse the declaration: {'; '.join(problems)}"
+               if problems else "")
             + ("" if self._connected else "\nConnect to the broker to send."))
+        blockers = blockers + problems
         self.start_btn.setText("Restart run" if state == "ACTIVE" else "Allow start")
         self.start_btn.setEnabled(self._connected and team.declaration_seq is not None
                                   and not blockers)

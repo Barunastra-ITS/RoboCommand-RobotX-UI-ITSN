@@ -49,9 +49,9 @@ press a send button**. It has four tabs:
 | Tab | Does | Replaces |
 |---|---|---|
 | **Map** | Monitor: the panels below | — |
-| **Course** | Edit and publish the retained `RxCourse`. **Presets** list on the left: pick one to load it, **+ Add preset** saves a new one, **Update preset** overwrites the loaded one without asking a name (`~/.config/robocommand_ui/course_presets.json`). Course ID filled from the course this host serves; pinger as a number in Hz; live validity; ring closed automatically; last publish time; clear the retained course. **Boundary map:** the Centre fields follow the map as it moves (or type a centre → **Go**); click the satellite map to pin corners (click an edge to insert, drag to move, right-click to delete); the coordinate table fills itself, and edits to the table move the pins | `rc course …` |
-| **Run start** | Every team that sent a RunDeclaration; select one and press **Allow start** (declaration seq filled in from the declaration). Start is enabled only when every declared vehicle is LIVE and in AUTO; RunStart clears that team's trails and task overlays from the map. **End run** closes an ACTIVE run on this host — the protocol has no run-end message, so nothing is sent: the run log is saved to `~/.local/share/robocommand_ui/runs/` (`$ROBOCOMMAND_RUN_LOG_DIR`) and the team shows **ENDED** until its next RunDeclaration, which appears as DECLARED. A team that declares again while ACTIVE closes its previous run log automatically. **Finished runs** lists saved runs by Run ID; **Replay** redraws that run's map and vehicle movement on a timeline | `rc run-start …` |
-| **Task 4** | Core (assistance request, readiness confirm), Advanced (keep-out zone, all clear), Disruptive (moving object alert). Shows the team's declared tier and a history that matches each command with its IncidentAck / ReadinessReport; the readiness confirm fills itself in | `rc assistance-request …` etc. |
+| **Course** | Edit and publish the retained `RxCourse`. **Presets** list on the left: pick one to load it, **+ Add preset** saves a new one, **Update preset** overwrites the loaded one without asking a name (`~/.config/robocommand_ui/course_presets.json`). Course ID filled from the course this host serves; pinger as a number in Hz; live validity; ring closed automatically; last publish time; clear the retained course. **Boundary map:** the Centre fields follow the map as it moves (or type a centre → **Go**); click the satellite map to pin corners (click an edge to insert, drag to move, right-click to delete); the coordinate table fills itself, and edits to the table move the pins. **Boundary / UAV transit** picks which ring the table and pins edit (the other is drawn dashed): the optional UAV transit area (`uav_transit_area`) is where a declared UAV geofence may lie beyond the boundary — takeoff, landing and the way to and from the course | `rc course …` |
+| **Run start** | Every team that sent a RunDeclaration; select one and press **Allow start** (declaration seq filled in from the declaration). Start is enabled only when every declared vehicle is LIVE and in AUTO and, with a UAV, the declaration passes RoboCommand's geofence check (every geofence point within the course or UAV transit area to 1 m, ceiling above 0 and at most 50 m HAE; the UAV pilot call sign and ceiling are shown); RunStart clears that team's trails and task overlays from the map. **End run** closes an ACTIVE run on this host — the protocol has no run-end message, so nothing is sent: the run log is saved to `~/.local/share/robocommand_ui/runs/` (`$ROBOCOMMAND_RUN_LOG_DIR`) and the team shows **ENDED** until its next RunDeclaration, which appears as DECLARED. A team that declares again while ACTIVE closes its previous run log automatically. **Finished runs** lists saved runs by Run ID; **Replay** redraws that run's map and vehicle movement on a timeline | `rc run-start …` |
+| **Task 4** | Core (assistance request, readiness confirm), Advanced (keep-out zone, all clear), Disruptive (moving object alert, with its keep-out radius: 5 m by default). Every panel can be edited; only the declared tier's send buttons work. The **Incident map** shows the course and UAV transit area, the team's vehicles, trails, geofence and reported objects; its centre crosshair is the command position — pan the map and every tier's position follows (typing a position moves the map), and every tier's command is previewed as it would be sent (the declared tier labelled, the others faint): assistance point, keep-out zone at its radius, moving object with its keep-out radius and heading arrow. Shows the team's declared tier and a history that matches each command with its IncidentAck / ReadinessReport; the readiness confirm fills itself in | `rc assistance-request …` etc. |
 
 The Map tab's **Clear** removes trails and task overlays by hand (RunStart does it per team).
 **Light / Dark mode** (tab bar, right) switches the theme; light is the default and is remembered.
@@ -144,7 +144,9 @@ r.publish_report("USV1", "safe_passage", safe_passage_report)   # any RxReport b
 ```
 
 Declaring a UAV requires `--geofence "lat,lng;lat,lng;..."` (closed automatically,
-at least 4 points). `--tiers` must not use `UNKNOWN`; use `NONE` for tasks not attempted.
+at least 4 points); `--uav-ceiling` sets its max altitude in meters HAE (default 40,
+at most 50), `--uav-pilot-callsign` the pilot's MyDroneFleets call sign, and
+`--uav-registration` the UAV's CAAS number sent in its heartbeats. `--tiers` must not use `UNKNOWN`; use `NONE` for tasks not attempted.
 
 ## Local testing
 
@@ -184,6 +186,7 @@ robocommand_ui/
   courses.py                  Course table, host resolution, DHCP-based course detection
   course_validation.py        RxCourse checks (§3.4.9)
   fleet_state.py              What every team/vehicle reported: trails, rate, seq, run state
+  uav_geofence.py             RoboCommand's UAV geofence check of a RunDeclaration
   proto_helper.py             Protobuf imports + payload parsing + enum helpers
   sequence_tracker.py         Outgoing sequence counters (used by report.py)
   mqtt_worker.py              Listen-only MQTT client in a QThread

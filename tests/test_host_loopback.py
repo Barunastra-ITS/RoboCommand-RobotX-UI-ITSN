@@ -237,11 +237,15 @@ class TestHostLoopback(unittest.TestCase):
     def test_6b_task4_assistance_ack_readiness_confirm(self):
         tab = self.win.task4_tab
         self.assertEqual(tab.selected_team(), TEAM)
-        # Task 4 declared CORE: only the Core panel can send
+        # Task 4 declared CORE: every panel can be edited, only Core's buttons send
         self.assertEqual(tab.core.meta_label.text(), "declared")
-        self.assertTrue(tab.core.isEnabled())
-        self.assertFalse(tab.advanced.isEnabled())
-        self.assertFalse(tab.disruptive.isEnabled())
+        for panel in (tab.core, tab.advanced, tab.disruptive):
+            self.assertTrue(panel.isEnabled())
+        sendable = {b.text(): b.isEnabled() for b, _ in tab._send_buttons}
+        self.assertEqual(sendable, {
+            "Send assistance request": True, "Send readiness confirm": True,
+            "Send keep-out zone": False, "Send all clear": False,
+            "Send moving object alert": False})
         self.assertIn("CORE", tab.advanced.meta_label.text())
         sent_before = len(self.win.incidents.entries(TEAM))
         self._click(tab, "Send keep-out zone")                          # disabled: nothing sent

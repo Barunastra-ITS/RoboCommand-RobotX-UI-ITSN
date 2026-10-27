@@ -46,6 +46,7 @@ DETAIL_LAYOUT = [
     ("Alt / Depth", 2, 0, False), ("Flight", 2, 1, False),
     ("Roll / Pitch", 3, 0, False), ("Report seq", 3, 1, False),
     ("Reports", 4, 0, True),
+    ("Registration", 5, 0, True),      # UAV only: Heartbeat.uav_registration (CAAS)
 ]
 
 
@@ -176,6 +177,9 @@ class MonitorCard(QFrame):
         self._set("Alt / Depth", f"{hb.altitude_hae_m:.1f} / {hb.depth_m:.1f} m")
         self._set("Roll / Pitch", f"{hb.roll_deg:.1f}° / {hb.pitch_deg:.1f}°")
         self._set("Flight", flight_phase_name(hb.flight_phase))
+        if vehicle_type_name(v.vehicle_type) == "UAV":
+            self._set("Registration", hb.uav_registration or "— (team has one UAV)",
+                      theme.TEXT if hb.uav_registration else theme.TEXT_FAINT)
 
 
 class VehicleMonitorPanel(Panel):

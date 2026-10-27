@@ -11,6 +11,12 @@ Corners can be typed in the table or pinned on the map; the table and the
 pins stay in sync both ways, and the Centre fields follow the map as it is
 panned (or type a centre and press Go). The Course ID follows the course
 this host serves (from its address), so it is filled in already.
+
+**Boundary / UAV transit** picks which ring the table and the map pins edit;
+the other is drawn dashed on the map. The UAV transit area (optional) is
+where a declared UAV geofence may lie beyond the boundary: takeoff, landing
+and the way to and from the course. Without one, the geofence must fit the
+boundary.
 """
 
 import time
@@ -19,7 +25,7 @@ from typing import List, Optional, Tuple
 
 from PyQt5.QtCore import Qt, pyqtSignal
 from PyQt5.QtWidgets import (
-    QAbstractItemView, QAbstractSpinBox, QFormLayout, QHBoxLayout, QHeaderView, QInputDialog,
+    QAbstractItemView, QAbstractSpinBox, QButtonGroup, QFormLayout, QHBoxLayout, QHeaderView, QInputDialog,
     QLabel, QLineEdit, QListWidget, QListWidgetItem, QMessageBox, QTableWidget, QTableWidgetItem,
     QVBoxLayout, QWidget,
 )
@@ -32,14 +38,16 @@ from robocommand_ui.course_presets import (
 from robocommand_ui.course_validation import validate_course
 from robocommand_ui.courses import course_id_of
 from robocommand_ui.widgets.boundary_map import DEFAULT_ZOOM, BoundaryMap
-from robocommand_ui.widgets.form import button, caption, coord_spin, int_spin
+from robocommand_ui.widgets.form import button, caption, coord_spin, int_spin, unit_label
 from robocommand_ui.widgets.panel import Panel, make_chip, set_chip
 
 LatLng = Tuple[float, float]
 MAX_PINGER_HZ = 200_000
 PRESETS_WIDTH = 250
 EDITOR_WIDTH = 440
-SAME_CORNER = 1e-7          # degrees: what the table's 7 decimals can tell apart
+SAME_CORNER = 5e-10         # degrees: what the table's 9 decimals can tell apart
+BOUNDARY, TRANSIT = "boundary", "transit"
+RING_NAMES = {BOUNDARY: "corner", TRANSIT: "transit point"}
 
 
 def ring_center(corners) -> Optional[LatLng]:
@@ -83,6 +91,7 @@ class CourseTab(QWidget):
         self._broker_course = None
         self._rc_course = None                  # courses.Course this host serves
         self._id_typed = False                  # operator typed their own Course ID
+        self._editing = BOUNDARY                # ring the table and map pins edit
 
         row = QHBoxLayout(self)
         row.setContentsMargins(20, 16, 20, 16)
@@ -161,27 +170,43 @@ class CourseTab(QWidget):
         self.pinger.setFont(theme.mono_font(10))
         self.pinger.setToolTip(f"Pinger frequency in hertz (1 – {MAX_PINGER_HZ})")
         pinger_row.addWidget(self.pinger, 1)
-        unit = QLabel("Hz")
-        unit.setObjectName("Unit")
-        pinger_row.addWidget(unit, 0, Qt.AlignVCenter)
+        pinger_row.addWidget(unit_label("Hz"), 0, Qt.AlignVCenter)
         form.addRow("Pinger frequency", pinger_row)
         panel.body.addLayout(form)
 
-        self.corners = QTableWidget(0, 2)
-        self.corners.setHorizontalHeaderLabels(["Latitude", "Longitude"])
-        self.corners.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
-        self.corners.setSelectionBehavior(QAbstractItemView.SelectRows)
-        self.corners.setFont(theme.mono_font(10))
-        self.corners.setMinimumHeight(180)
+        ring_row = QHBoxLayout()
+        ring_row.setSpacing(6)
+        self.ring_buttons = QButtonGroup(self)
+        self.ring_btns = {}
+        for key, text, tip in (
+                (BOUNDARY, "Boundary", "Edit the course boundary (RxCourse.corners)"),
+                (TRANSIT, "UAV transit", "Edit the UAV transit area (RxCourse.uav_transit_area):"
+                 "\nwhere a UAV geofence may lie beyond the boundary. Optional")):
+            btn = button(text, "Ghost", tip)
+            btn.setCheckable(True)
+            self.ring_buttons.addButton(btn)
+            self.ring_btns[key] = btn
+            btn.clicked.connect(lambda _=False, k=key: self.set_editing(k))
+            ring_row.addWidget(btn)
+        self.ring_btns[BOUNDARY].setChecked(True)
+        ring_row.addStretch()
+        self.ring_note = caption("")
+        ring_row.addWidget(self.ring_note)
+        panel.body.addLayout(ring_row)
+
+        self.corners = self._ring_table()
+        self.transit = self._ring_table()
+        self.transit.setVisible(False)
         panel.body.addWidget(self.corners, 1)
+        panel.body.addWidget(self.transit, 1)
 
         edit_row = QHBoxLayout()
-        add_btn = button("+ Corner", "Ghost", "Add a corner after the selected one")
-        add_btn.clicked.connect(self._add_corner)
-        remove_btn = button("− Corner", "Ghost", "Remove the selected corner")
-        remove_btn.clicked.connect(self._remove_corner)
-        edit_row.addWidget(add_btn)
-        edit_row.addWidget(remove_btn)
+        self.add_point_btn = button("+ Corner", "Ghost", "Add a point after the selected one")
+        self.add_point_btn.clicked.connect(self._add_corner)
+        self.remove_point_btn = button("− Corner", "Ghost", "Remove the selected point")
+        self.remove_point_btn.clicked.connect(self._remove_corner)
+        edit_row.addWidget(self.add_point_btn)
+        edit_row.addWidget(self.remove_point_btn)
         edit_row.addStretch()
         panel.body.addLayout(edit_row)
 
@@ -199,7 +224,18 @@ class CourseTab(QWidget):
         self.course_id.textEdited.connect(lambda _: setattr(self, "_id_typed", True))
         self.pinger.valueChanged.connect(self._on_fields_edited)
         self.corners.itemChanged.connect(self._on_fields_edited)
+        self.transit.itemChanged.connect(self._on_fields_edited)
         return panel
+
+    @staticmethod
+    def _ring_table() -> QTableWidget:
+        table = QTableWidget(0, 2)
+        table.setHorizontalHeaderLabels(["Latitude", "Longitude"])
+        table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        table.setFont(theme.mono_font(10))
+        table.setMinimumHeight(180)
+        return table
 
     def _build_map_panel(self) -> Panel:
         panel = Panel("Boundary map", dot=theme.MAP_PIN)
@@ -217,10 +253,10 @@ class CourseTab(QWidget):
         go_btn = button("Go", "Primary", "Move the map to this centre point")
         go_btn.clicked.connect(self._go_to_center)
         row.addWidget(go_btn)
-        fit_btn = button("Fit corners", "Ghost", "Zoom the map to the pinned corners")
+        fit_btn = button("Fit corners", "Ghost", "Zoom the map to the boundary and transit area")
         fit_btn.clicked.connect(lambda: self.map.fit_corners())
         row.addWidget(fit_btn)
-        clear_btn = button("Clear pins", "Ghost", "Remove every corner")
+        clear_btn = button("Clear pins", "Ghost", "Remove every point of the ring being edited")
         clear_btn.clicked.connect(self._clear_corners)
         row.addWidget(clear_btn)
         panel.body.addLayout(row)
@@ -304,6 +340,8 @@ class CourseTab(QWidget):
             item.setData(Qt.UserRole, name)
             item.setToolTip(f"{preset.course_id} · {preset.pinger_freq_hz} Hz · "
                             f"{len(open_ring(preset.corners))} corners"
+                            + (f" · UAV transit {len(open_ring(preset.transit))} points"
+                               if preset.transit else "")
                             + (" · built-in" if preset.builtin else ""))
             self.preset_list.addItem(item)
             if name == current:
@@ -321,7 +359,7 @@ class CourseTab(QWidget):
             return
         self._active = name
         self.set_fields(self.rc_course_id() or preset.course_id, preset.pinger_freq_hz,
-                        preset.corners)
+                        preset.corners, preset.transit)
         self._center_on_corners()
         self._sync_preset_buttons()
 
@@ -331,11 +369,13 @@ class CourseTab(QWidget):
         if preset is None:
             return False
         corners, error = self.read_corners()
+        transit, transit_error = self.read_transit()
         course_id = self.course_id.text().strip()
-        return bool(error) or not (
+        return bool(error or transit_error) or not (
             course_id in (preset.course_id, self.rc_course_id())    # auto-filled ID isn't an edit
             and self.pinger.value() == preset.pinger_freq_hz
-            and same_ring(corners, preset.corners))
+            and same_ring(corners, preset.corners)
+            and same_ring(transit, preset.transit))
 
     def _sync_preset_buttons(self) -> None:
         preset = self._presets.get(self._active or "")
@@ -347,11 +387,12 @@ class CourseTab(QWidget):
 
     def _preset_from_fields(self, name: str) -> Optional[CoursePreset]:
         corners, error = self.read_corners()
-        if error:
-            QMessageBox.warning(self, "Cannot save preset", error)
+        transit, transit_error = self.read_transit()
+        if error or transit_error:
+            QMessageBox.warning(self, "Cannot save preset", error or transit_error)
             return None
         return CoursePreset(name, self.course_id.text().strip(), self.pinger.value(),
-                            tuple(close_ring(corners)))
+                            tuple(close_ring(corners)), tuple(close_ring(transit)))
 
     def _write_preset(self, preset: CoursePreset, verb: str) -> None:
         try:
@@ -409,19 +450,49 @@ class CourseTab(QWidget):
         self.log.emit(f"Deleted course preset '{name}'")
 
     # ---------- fields ----------
-    def set_fields(self, course_id: str, pinger_hz: int, corners) -> None:
+    def set_fields(self, course_id: str, pinger_hz: int, corners, transit=()) -> None:
         self.course_id.blockSignals(True)
         self.course_id.setText(course_id)
         self.course_id.blockSignals(False)
         self.pinger.blockSignals(True)
         self.pinger.setValue(pinger_hz)
         self.pinger.blockSignals(False)
-        self.corners.blockSignals(True)
-        self.corners.setRowCount(0)
-        for lat, lng in open_ring(corners):      # shown open; closed again on publish
-            self._append_row(f"{lat:.7f}", f"{lng:.7f}")
-        self.corners.blockSignals(False)
+        self._fill_table(self.corners, open_ring(corners))     # shown open; closed on publish
+        self._fill_table(self.transit, open_ring(transit))
         self._on_fields_edited()
+
+    def _fill_table(self, table: QTableWidget, ring) -> None:
+        table.blockSignals(True)
+        table.setRowCount(0)
+        for lat, lng in ring:
+            self._append_row(f"{lat:.9f}", f"{lng:.9f}", table=table)
+        table.blockSignals(False)
+
+    # ---------- ring being edited ----------
+    def editing(self) -> str:
+        return self._editing
+
+    def set_editing(self, ring: str) -> None:
+        """Edit the boundary or the UAV transit area in the table and on the map."""
+        self._editing = ring
+        self.ring_btns[ring].setChecked(True)
+        self.corners.setVisible(ring == BOUNDARY)
+        self.transit.setVisible(ring == TRANSIT)
+        self.add_point_btn.setText("+ Corner" if ring == BOUNDARY else "+ Point")
+        self.remove_point_btn.setText("− Corner" if ring == BOUNDARY else "− Point")
+        self._validate()
+
+    def _active_table(self) -> QTableWidget:
+        return self.corners if self._editing == BOUNDARY else self.transit
+
+    def _sync_ring_note(self) -> None:
+        transit, error = self.read_transit()
+        if error:
+            self.ring_note.setText("UAV transit: fix the table")
+        elif transit:
+            self.ring_note.setText(f"UAV transit: {len(transit)} points")
+        else:
+            self.ring_note.setText("No UAV transit: geofence must fit the boundary")
 
     def _on_fields_edited(self, *_args) -> None:
         self._validate()
@@ -429,7 +500,7 @@ class CourseTab(QWidget):
 
     # ---------- map ----------
     def _go_to_center(self) -> None:
-        zoom = self.map.zoom() if self.map.corners() else DEFAULT_ZOOM
+        zoom = self.map.zoom() if self.map.corners() or self.map.backdrop() else DEFAULT_ZOOM
         self.map.set_center(self.center_lat.value(), self.center_lng.value(), zoom)
 
     def _on_map_moved(self, lat: float, lng: float) -> None:
@@ -443,74 +514,90 @@ class CourseTab(QWidget):
 
     def _center_on_corners(self) -> None:
         corners, error = self.read_corners()
+        if not error and not corners:
+            corners, error = self.read_transit()
         center = ring_center(corners) if not error else None
         if center is None:
             return
         self.map.set_center(*center)
         self.map.fit_corners()              # the Centre fields follow via view_changed
 
-    def _on_map_corners(self, corners) -> None:
-        """Pins moved on the map: rewrite the table from them."""
-        self.corners.blockSignals(True)
-        self.corners.setRowCount(0)
-        for lat, lng in corners:
-            self._append_row(f"{lat:.7f}", f"{lng:.7f}")
-        self.corners.blockSignals(False)
+    def _on_map_corners(self, points) -> None:
+        """Pins moved on the map: rewrite the table of the ring being edited."""
+        self._fill_table(self._active_table(), points)
         self._validate(sync_map=False)
         self._sync_preset_buttons()
 
     def _clear_corners(self) -> None:
-        self.corners.setRowCount(0)
+        self._active_table().setRowCount(0)
         self._on_fields_edited()
 
-    def _append_row(self, lat: str = "", lng: str = "", at: Optional[int] = None) -> None:
-        row = self.corners.rowCount() if at is None else at
-        self.corners.insertRow(row)
-        self.corners.setItem(row, 0, QTableWidgetItem(lat))
-        self.corners.setItem(row, 1, QTableWidgetItem(lng))
+    def _append_row(self, lat: str = "", lng: str = "", at: Optional[int] = None,
+                    table: Optional[QTableWidget] = None) -> None:
+        table = table or self._active_table()
+        row = table.rowCount() if at is None else at
+        table.insertRow(row)
+        table.setItem(row, 0, QTableWidgetItem(lat))
+        table.setItem(row, 1, QTableWidgetItem(lng))
 
     def _add_corner(self) -> None:
-        current = self.corners.currentRow()
-        self.corners.blockSignals(True)
-        self._append_row(at=None if current < 0 else current + 1)
-        self.corners.blockSignals(False)
+        table = self._active_table()
+        current = table.currentRow()
+        table.blockSignals(True)
+        self._append_row(at=None if current < 0 else current + 1, table=table)
+        table.blockSignals(False)
         self._on_fields_edited()
 
     def _remove_corner(self) -> None:
-        current = self.corners.currentRow()
+        table = self._active_table()
+        current = table.currentRow()
         if current >= 0:
-            self.corners.removeRow(current)
+            table.removeRow(current)
             self._on_fields_edited()
 
     def read_corners(self) -> Tuple[List[LatLng], str]:
         """Corners from the table, or an error naming the first bad cell."""
-        corners = []
-        for row in range(self.corners.rowCount()):
+        return self._read_ring(self.corners, RING_NAMES[BOUNDARY])
+
+    def read_transit(self) -> Tuple[List[LatLng], str]:
+        """UAV transit area from its table (empty: none), or an error."""
+        return self._read_ring(self.transit, RING_NAMES[TRANSIT])
+
+    @staticmethod
+    def _read_ring(table: QTableWidget, what: str) -> Tuple[List[LatLng], str]:
+        points = []
+        for row in range(table.rowCount()):
             values = []
             for col, name in ((0, "latitude"), (1, "longitude")):
-                item = self.corners.item(row, col)
+                item = table.item(row, col)
                 text = item.text().strip() if item else ""
                 try:
                     values.append(float(text))
                 except ValueError:
-                    return [], f"corner {row + 1}: {name} '{text}' is not a number"
-            corners.append((values[0], values[1]))
-        return corners, ""
+                    return [], f"{what} {row + 1}: {name} '{text}' is not a number"
+            points.append((values[0], values[1]))
+        return points, ""
 
     def build(self):
         """The RxCourse to publish, plus its problems (empty when valid)."""
         corners, error = self.read_corners()
-        if error:
-            return None, [error]
+        transit, transit_error = self.read_transit()
+        if error or transit_error:
+            return None, [error or transit_error]
         course = build_course(self.course_id.text().strip(), self.pinger.value(),
-                              close_ring(corners))
+                              close_ring(corners), close_ring(transit))
         return course, validate_course(course)
 
     def _validate(self, sync_map: bool = True) -> None:
         if sync_map and hasattr(self, "map"):      # the map is built after the editor
-            corners, error = self.read_corners()
-            if not error:
-                self.map.set_corners(corners)
+            rings = {}
+            for key, (points, error) in ((BOUNDARY, self.read_corners()),
+                                         (TRANSIT, self.read_transit())):
+                rings[key] = [] if error else points
+            other = TRANSIT if self._editing == BOUNDARY else BOUNDARY
+            self.map.set_corners(rings[self._editing])
+            self.map.set_backdrop(close_ring(rings[other]))
+        self._sync_ring_note()
         _, issues = self.build()
         if issues:
             set_chip(self.validity, f"INVALID · {issues[0]}", theme.FAULT)
@@ -544,11 +631,14 @@ class CourseTab(QWidget):
             return
         issues = validate_course(course)
         state = "VALID" if not issues else "INVALID: " + "; ".join(issues)
+        transit = (f"UAV transit {len(course.uav_transit_area)} points"
+                   if course.uav_transit_area else "no UAV transit")
         self.broker_summary.setText(
             f"{course.course_id or '<empty>'} · {course.pinger_freq_hz} Hz · "
-            f"{len(course.corners)} corners · {state}\npublished {sent_at_text(course)}")
+            f"{len(course.corners)} corners · {transit} · {state}\n"
+            f"published {sent_at_text(course)}")
         self.broker_summary.setToolTip("\n".join(
-            f"{i + 1:>2}  {c.latitude:.7f}, {c.longitude:.7f}"
+            f"{i + 1:>2}  {c.latitude:.9f}, {c.longitude:.9f}"
             for i, c in enumerate(course.corners)))
 
     def _copy_broker_course(self) -> None:
@@ -560,5 +650,6 @@ class CourseTab(QWidget):
             self.preset_list.setCurrentItem(None)
             self.preset_list.blockSignals(False)
             self.set_fields(c.course_id, c.pinger_freq_hz,
-                            [(p.latitude, p.longitude) for p in c.corners])
+                            [(p.latitude, p.longitude) for p in c.corners],
+                            [(p.latitude, p.longitude) for p in c.uav_transit_area])
             self._center_on_corners()

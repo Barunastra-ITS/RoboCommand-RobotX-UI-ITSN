@@ -6,7 +6,10 @@ Built-in presets ship with the app; the operator's own are stored as JSON in
 
     {"presets": [{"name": "Lake bench", "course_id": "ALPHA",
                   "pinger_freq_hz": 25000,
-                  "corners": [[-7.261, 112.791], [-7.261, 112.795], ...]}]}
+                  "corners": [[-7.261, 112.791], [-7.261, 112.795], ...],
+                  "uav_transit_area": [[-7.262, 112.791], ...]}]}
+
+``uav_transit_area`` is optional (older files have none).
 
 A saved preset with a built-in's name replaces that built-in. Qt-free.
 """
@@ -26,18 +29,21 @@ class CoursePreset:
     course_id: str
     pinger_freq_hz: int
     corners: Tuple[LatLng, ...]
+    transit: Tuple[LatLng, ...] = ()        # RxCourse.uav_transit_area; empty: none
     builtin: bool = False
 
     def to_json(self) -> dict:
         return {"name": self.name, "course_id": self.course_id,
                 "pinger_freq_hz": self.pinger_freq_hz,
-                "corners": [list(c) for c in self.corners]}
+                "corners": [list(c) for c in self.corners],
+                "uav_transit_area": [list(c) for c in self.transit]}
 
     @staticmethod
     def from_json(data: dict) -> "CoursePreset":
         corners = tuple((float(lat), float(lng)) for lat, lng in data["corners"])
+        transit = tuple((float(lat), float(lng)) for lat, lng in data.get("uav_transit_area", []))
         return CoursePreset(str(data["name"]), str(data["course_id"]),
-                            int(data["pinger_freq_hz"]), corners)
+                            int(data["pinger_freq_hz"]), corners, transit)
 
 
 BUILTIN_PRESETS = (
@@ -47,6 +53,14 @@ BUILTIN_PRESETS = (
     CoursePreset("Promontory SG", "ALPHA", 25000,
                  ((1.280329, 103.8556869), (1.2804716, 103.8554529), (1.2808993, 103.8557337),
                   (1.2807567, 103.8559743), (1.280329, 103.8556869)), builtin=True),
+    # Upstream test server's Course Alpha and Garuda's Transit A (2026-10-23);
+    # the competition's own may differ
+    CoursePreset("Course Alpha SG + Transit A", "ALPHA", 25000,
+                 ((1.2809652, 103.8548424), (1.2808457, 103.8550331), (1.2810752, 103.8551770),
+                  (1.2811947, 103.8549863), (1.2809652, 103.8548424)),
+                 transit=((1.281294119, 103.855048646), (1.281174598, 103.855239379),
+                          (1.2810752, 103.8551770), (1.2811947, 103.8549863),
+                          (1.281294119, 103.855048646)), builtin=True),
 )
 
 
@@ -86,7 +100,7 @@ def save_preset(path: Path, preset: CoursePreset) -> List[CoursePreset]:
     """Add or replace a user preset by name; returns the new user list."""
     user = [p for p in load_user_presets(path) if p.name != preset.name]
     user.append(CoursePreset(preset.name, preset.course_id, preset.pinger_freq_hz,
-                             tuple(preset.corners)))
+                             tuple(preset.corners), tuple(preset.transit)))
     _write(path, user)
     return user
 

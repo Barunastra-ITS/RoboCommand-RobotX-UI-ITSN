@@ -31,7 +31,8 @@ class CoursePanel(Panel):
         self.course_id_label = self._row(grid, 0, "Course ID")
         self.pinger_label = self._row(grid, 1, "Pinger")
         self.corners_label = self._row(grid, 2, "Corners")
-        self.timestamp_label = self._row(grid, 3, "Published")
+        self.transit_label = self._row(grid, 3, "UAV transit")
+        self.timestamp_label = self._row(grid, 4, "Published")
         grid.setColumnStretch(1, 1)
         self.body.addLayout(grid)
 
@@ -65,6 +66,8 @@ class CoursePanel(Panel):
         self.course_id_label.setText(course.course_id or "—")
         self.pinger_label.setText(f"{course.pinger_freq_hz} Hz")
         self.corners_label.setText(str(len(course.corners)))
+        self.transit_label.setText(f"{len(course.uav_transit_area)} points"
+                                   if course.uav_transit_area else "none")
         if course.sent_at and course.sent_at.seconds:
             ts = datetime.datetime.fromtimestamp(course.sent_at.seconds)
             self.timestamp_label.setText(ts.strftime("%Y-%m-%d %H:%M:%S"))
@@ -74,7 +77,7 @@ class CoursePanel(Panel):
         self.corner_table.setRowCount(len(course.corners))
         for i, corner in enumerate(course.corners):
             for col, val in enumerate((corner.latitude, corner.longitude)):
-                item = QTableWidgetItem(f"{val:.7f}")
+                item = QTableWidgetItem(f"{val:.9f}")
                 item.setFont(theme.mono_font(9))
                 self.corner_table.setItem(i, col, item)
         self.corners_btn.setEnabled(True)

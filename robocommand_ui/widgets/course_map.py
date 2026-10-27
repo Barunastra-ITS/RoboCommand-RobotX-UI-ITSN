@@ -1,6 +1,7 @@
 """Top-down course map: what teams report, drawn in local metres.
 
-Only reported data is drawn: the RxCourse boundary, each team's declared UAV
+Only reported data is drawn: the RxCourse boundary and UAV transit area
+(dashed), each team's declared UAV
 geofence, every vehicle's position, heading and fading trail (labelled
 TEAM/VEHICLE, dimmed when its heartbeats go stale), and the latest Task 1
 buoys / Task 2 pipeline reports. Positions are projected to metres around
@@ -57,9 +58,9 @@ SEGMENTS = {
 class CourseMapWidget(Panel):
     clear_requested = pyqtSignal()          # operator wants trails / task overlays gone
 
-    def __init__(self, parent=None):
-        super().__init__("Course map", parent, body_margins=(0, 0, 0, 0))
-        self._canvas = MapCanvas(self)
+    def __init__(self, parent=None, title: str = "Course map", canvas=None, clearable: bool = True):
+        super().__init__(title, parent, body_margins=(0, 0, 0, 0))
+        self._canvas = canvas if canvas is not None else MapCanvas(self)
         self.body.addWidget(self._canvas, 1)
 
         self.sat_btn = QPushButton("Satellite")
@@ -80,13 +81,14 @@ class CourseMapWidget(Panel):
         self.trails_btn.toggled.connect(self._canvas.set_show_trails)
         self.actions.addWidget(self.trails_btn)
 
-        clear_btn = QPushButton("Clear")
-        clear_btn.setObjectName("Ghost")
-        clear_btn.setCursor(Qt.PointingHandCursor)
-        clear_btn.setToolTip("Clear trails and Task 1 / Task 2 overlays of the team shown\n"
-                             "(every RunStart does this automatically)")
-        clear_btn.clicked.connect(self.clear_requested)
-        self.actions.addWidget(clear_btn)
+        if clearable:
+            clear_btn = QPushButton("Clear")
+            clear_btn.setObjectName("Ghost")
+            clear_btn.setCursor(Qt.PointingHandCursor)
+            clear_btn.setToolTip("Clear trails and Task 1 / Task 2 overlays of the team shown\n"
+                                 "(every RunStart does this automatically)")
+            clear_btn.clicked.connect(self.clear_requested)
+            self.actions.addWidget(clear_btn)
 
         fit_btn = QPushButton("Fit")
         fit_btn.setObjectName("Ghost")
@@ -97,7 +99,8 @@ class CourseMapWidget(Panel):
 
     def set_course(self, course):
         self._canvas.set_course_points(
-            [(c.latitude, c.longitude) for c in course.corners], course.course_id)
+            [(c.latitude, c.longitude) for c in course.corners], course.course_id,
+            [(c.latitude, c.longitude) for c in course.uav_transit_area])
         self._update_meta()
 
     def show_fleet(self, fleet, team_filter=None, now: Optional[float] = None):
@@ -149,6 +152,7 @@ class MapCanvas(QWidget):
         self.setMouseTracking(True)
         self.setCursor(Qt.OpenHandCursor)
         self._course_points: List[LatLng] = []
+        self._transit_points: List[LatLng] = []
         self._geofence_points: List[LatLng] = []
         self._vehicles: Dict[str, tuple] = {}     # label -> (heartbeat, trail, stale)
         self._course_id = ""
@@ -172,8 +176,9 @@ class MapCanvas(QWidget):
         self._compass_hover = False
 
     # ---------------- data ----------------
-    def set_course_points(self, points, course_id=""):
+    def set_course_points(self, points, course_id="", transit=()):
         self._course_points = list(points)
+        self._transit_points = list(transit)
         self._course_id = course_id
         self._origin = None
         self._user_view = False
@@ -224,6 +229,22 @@ class MapCanvas(QWidget):
             self._origin = (sum(p[0] for p in pts) / len(pts), sum(p[1] for p in pts) / len(pts))
         return True
 
+    def center_latlng(self) -> Optional[LatLng]:
+        """Point under the centre of the map, or None before anything is drawn."""
+        if self._origin is None:
+            return None
+        return self._px0_to_latlng(QPointF(self.width() / 2, self.height() / 2))
+
+    def set_center_latlng(self, lat: float, lng: float) -> None:
+        """Pan the map so (lat, lng) is under its centre (keeps the zoom)."""
+        if not self._ensure_origin():
+            self._origin = (lat, lng)
+        if not self._user_view and (self._course_points or self._vehicles):
+            self._fit()                 # a sensible zoom before the first pan
+        self._center_m = self.to_m(lat, lng)
+        self._user_view = True
+        self.update()
+
     def to_m(self, lat: float, lng: float) -> Tuple[float, float]:
         lat0, lng0 = self._origin
         return ((lng - lng0) * M_PER_DEG_LAT * math.cos(math.radians(lat0)),
@@ -268,7 +289,7 @@ class MapCanvas(QWidget):
         p.translate(-self.width() / 2, -self.height() / 2)
 
     def _fit(self):
-        pts = list(self._course_points) + list(self._geofence_points)
+        pts = list(self._course_points) + list(self._transit_points) + list(self._geofence_points)
         if not pts:
             pts = [(hb.position.latitude, hb.position.longitude) for hb, _, _ in self._vehicles.values()]
         # extents in the turned frame (x right, y down on screen), in metres
@@ -354,14 +375,23 @@ class MapCanvas(QWidget):
         drew_tiles = self._show_tiles and self._draw_tiles(p)
         if not drew_tiles:
             self._draw_grid(p)
+        self._draw_transit(p)
         self._draw_boundary(p)
         self._draw_geofence(p)
         self._draw_tasks(p)
         if self._show_trails:
             self._draw_trails(p)
         self._draw_vehicles(p)
+        self._draw_overlay(p)
         self._draw_scale_and_north(p)
         self._draw_legend(p)
+        self._painted()
+
+    def _draw_overlay(self, p):
+        """Extra drawing above the vehicles (subclasses)."""
+
+    def _painted(self):
+        """Called after every paint with the view settled (subclasses)."""
 
     def _px0_to_latlng(self, q: QPointF) -> LatLng:
         x, y = self._px0_to_m(q)
@@ -487,6 +517,19 @@ class MapCanvas(QWidget):
         for a, b in self._course_points[:-1]:
             p.drawEllipse(self.to_px(a, b), 2.5, 2.5)
 
+    def _draw_transit(self, p):
+        if len(self._transit_points) < 3:
+            return
+        poly = QPolygonF([self.to_px(a, b) for a, b in self._transit_points])
+        p.setBrush(QBrush(theme.qcolor(theme.MAP_BOUNDARY, 10)))
+        p.setPen(QPen(theme.qcolor(theme.MAP_DIM, 120), 3.0))      # halo, as the boundary
+        p.drawPolygon(poly)
+        pen = QPen(theme.qcolor(theme.MAP_BOUNDARY, 200), 1.3, Qt.DashLine)
+        pen.setDashPattern([3, 3])
+        p.setBrush(Qt.NoBrush)
+        p.setPen(pen)
+        p.drawPolygon(poly)
+
     def _draw_geofence(self, p):
         if len(self._geofence_points) < 3:
             return
@@ -584,6 +627,8 @@ class MapCanvas(QWidget):
     def _draw_legend(self, p):
         types = sorted({vehicle_type_name(hb.vehicle_type) for hb, _, _ in self._vehicles.values()})
         items = [(theme.type_color(t), t) for t in types]
+        if len(self._transit_points) >= 3:
+            items.append((None, "UAV transit area"))           # drawn as its dashed outline
         if self._geofence_points:
             items.append((theme.MAP_GEOFENCE, "UAV geofence"))
         if not items:
@@ -598,8 +643,16 @@ class MapCanvas(QWidget):
         p.drawRoundedRect(r, 6, 6)
         for i, (color, text) in enumerate(items):
             cy = r.top() + 13 + i * 16
-            p.setPen(Qt.NoPen)
-            p.setBrush(QBrush(theme.qcolor(color)))
-            p.drawRoundedRect(QRectF(r.left() + 10, cy - 4, 10, 8), 2, 2)
+            swatch = QRectF(r.left() + 10, cy - 4, 10, 8)
+            if color is None:
+                pen = QPen(theme.qcolor(theme.TEXT_MUTED), 1.2, Qt.DashLine)
+                pen.setDashPattern([2, 2])
+                p.setPen(pen)
+                p.setBrush(Qt.NoBrush)
+                p.drawRect(swatch)
+            else:
+                p.setPen(Qt.NoPen)
+                p.setBrush(QBrush(theme.qcolor(color)))
+                p.drawRoundedRect(swatch, 2, 2)
             p.setPen(theme.qcolor(theme.TEXT_MUTED))
             p.drawText(QPointF(r.left() + 26, cy + 4), text)

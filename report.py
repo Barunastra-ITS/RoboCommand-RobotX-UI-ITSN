@@ -44,11 +44,13 @@ from robocommand_ui.proto_helper import (
     common_pb2, now_ts, parse_mqtt_payload, rx_common_pb2, rx_reports_pb2, rx_requests_pb2,
 )
 from robocommand_ui.sequence_tracker import SequenceTracker
+from robocommand_ui.uav_geofence import MAX_UAV_ALTITUDE_HAE_M
 
 log = logging.getLogger("report")
 
 HEARTBEAT_PERIOD_S = 0.5            # 2 Hz per vehicle (§3.4.11)
 MAX_MSGS_PER_S = 5                  # per system, i.e. per vehicle (§3.4 publishing limit)
+DEFAULT_UAV_CEILING_HAE_M = 40.0    # upstream test client's default geofence ceiling
 
 TELEMETRY_FIELDS = {
     "lat", "lng", "spd_mps", "heading_deg", "roll_deg", "pitch_deg",
@@ -85,13 +87,19 @@ class GcsReporter:
                  tiers: Tuple[int, int, int, int], geofence: List[Tuple[float, float]],
                  port: int = MQTT_PORT,
                  client_factory: Callable[[], mqtt.Client] = None,
-                 on_course: Callable[[object], None] = None):
+                 on_course: Callable[[object], None] = None,
+                 uav_ceiling_hae_m: float = DEFAULT_UAV_CEILING_HAE_M,
+                 uav_pilot_callsign: str = "",
+                 uav_registration: str = ""):
         self.host = host
         self.port = port
         self.team_id = team_id
         self.vehicles = dict(vehicles)
         self.tiers = tiers
         self.geofence = list(geofence)
+        self.uav_ceiling_hae_m = uav_ceiling_hae_m      # RunDeclaration, with a UAV
+        self.uav_pilot_callsign = uav_pilot_callsign
+        self.uav_registration = uav_registration        # UAV heartbeats (CAAS number)
         self.seq = SequenceTracker()
         self.course = None
         self.declaration_seq: Optional[int] = None
@@ -185,6 +193,8 @@ class GcsReporter:
                 task1_tier=self.tiers[0], task2_tier=self.tiers[1],
                 task3_tier=self.tiers[2], task4_tier=self.tiers[3],
                 uav_geofence=[common_pb2.LatLng(latitude=a, longitude=b) for a, b in self.geofence],
+                uav_geofence_max_altitude_hae_m=self.uav_ceiling_hae_m if self.geofence else 0.0,
+                uav_pilot_callsign=self.uav_pilot_callsign,
             ),
         )
         if not self._publish(f"{TOPIC_ROOT}/{self.team_id}/request", request, system=self.team_id):
@@ -214,6 +224,8 @@ class GcsReporter:
             current_task=t.get("current_task", rx_common_pb2.TASK_NONE),
             vehicle_type=self.vehicles[vehicle_id],
             flight_phase=t.get("flight_phase", rx_common_pb2.FLIGHT_PHASE_UNKNOWN),
+            uav_registration=(self.uav_registration
+                              if self.vehicles[vehicle_id] == rx_common_pb2.TYPE_UAV else ""),
         )
         return self.publish_report(vehicle_id, "heartbeat", hb)
 
@@ -454,6 +466,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--tiers", default="NONE,NONE,NONE,NONE",
                    help="Task 1-4 tiers, e.g. CORE,ADVANCED,NONE,NONE")
     p.add_argument("--geofence", default="", help="UAV geofence 'lat,lng;lat,lng;...'")
+    p.add_argument("--uav-ceiling", type=float, default=DEFAULT_UAV_CEILING_HAE_M, metavar="METERS",
+                   help="UAV geofence max altitude, meters HAE (above 0, at most 50)")
+    p.add_argument("--uav-pilot-callsign", default="",
+                   help="UAV pilot's MyDroneFleets call sign: first name + UAPL number")
+    p.add_argument("--uav-registration", default="",
+                   help="UAV CAAS registration number (may be empty with one drone registered)")
     p.add_argument("--simulate", action="store_true", help="orbit vehicles around the course centre")
     p.add_argument("-v", "--verbose", action="store_true")
     return p
@@ -472,8 +490,13 @@ def main(argv=None) -> int:
     geofence = parse_geofence(args.geofence) if args.geofence else []
     if rx_common_pb2.TYPE_UAV in vehicles.values() and len(geofence) < 4:
         raise SystemExit("a UAV is declared: --geofence needs a closed polygon of at least 4 points")
+    if geofence and not 0 < args.uav_ceiling <= MAX_UAV_ALTITUDE_HAE_M:
+        raise SystemExit(f"--uav-ceiling must be above 0 and at most {MAX_UAV_ALTITUDE_HAE_M:g} m HAE")
 
-    reporter = GcsReporter(choose_host(args), args.team, vehicles, tiers, geofence, port=args.port)
+    reporter = GcsReporter(choose_host(args), args.team, vehicles, tiers, geofence, port=args.port,
+                           uav_ceiling_hae_m=args.uav_ceiling,
+                           uav_pilot_callsign=args.uav_pilot_callsign,
+                           uav_registration=args.uav_registration)
     reporter.start()
     stop = threading.Event()
     source = run_simulation if args.simulate else run_stdin

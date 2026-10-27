@@ -9,6 +9,8 @@ This module keeps, per team and per vehicle:
 - RxReport.seq checks: gaps, duplicates/regressions, restarts (§3.4.8)
 - current_task transitions that start/end task attempts
 - the team's RunDeclaration and whether RunStart.declaration_seq matches it
+- whether that declaration's UAV geofence and ceiling are what RoboCommand
+  accepts against the retained RxCourse (``declaration_problems``)
 - the latest Task 1 / Task 2 report contents for drawing on the map
 
 It is Qt-free and has no I/O, so it can be unit-tested directly.
@@ -19,7 +21,10 @@ from collections import deque
 from typing import Deque, Dict, List, Optional, Tuple
 
 from robocommand_ui.courses import TOPIC_ROOT
-from robocommand_ui.proto_helper import common_pb2, robot_state_name, rx_common_pb2, rx_task_name
+from robocommand_ui.proto_helper import (
+    common_pb2, robot_state_name, rx_common_pb2, rx_task_name, vehicle_type_name,
+)
+from robocommand_ui.uav_geofence import geofence_problems, is_uav
 
 TRAIL_LENGTH = 1200          # 10 minutes at 2 Hz
 RATE_WINDOW_S = 5.0
@@ -70,6 +75,8 @@ class TeamState:
         self.undeclared_warned: set = set()       # vehicles already warned as undeclared
         self.tiers: Tuple[int, int, int, int] = (0, 0, 0, 0)
         self.geofence: List[LatLng] = []
+        self.geofence_ceiling_hae_m = 0.0         # RunDeclaration.uav_geofence_max_altitude_hae_m
+        self.uav_pilot_callsign = ""
         self.last_request_seq = 0
         self.last_command_seq = 0
         # (seq, run_id, declaration_seq) of RunStarts already applied, newest last: an
@@ -126,6 +133,14 @@ class FleetState:
     def __init__(self):
         self.teams: Dict[str, TeamState] = {}
         self.vehicles: Dict[Tuple[str, str], VehicleTrack] = {}
+        # Retained RxCourse rings the UAV geofence is checked against
+        self.course_corners: List[LatLng] = []
+        self.course_transit: List[LatLng] = []
+
+    def set_course(self, corners, transit=()) -> None:
+        """The retained RxCourse boundary and UAV transit area (lists of (lat, lng))."""
+        self.course_corners = [tuple(c) for c in corners]
+        self.course_transit = [tuple(c) for c in transit]
 
     def clear(self) -> None:
         self.teams = {}
@@ -221,6 +236,8 @@ class FleetState:
             team.declared_vehicles = list(decl.vehicle_ids)
             team.tiers = (decl.task1_tier, decl.task2_tier, decl.task3_tier, decl.task4_tier)
             team.geofence = [(p.latitude, p.longitude) for p in decl.uav_geofence]
+            team.geofence_ceiling_hae_m = decl.uav_geofence_max_altitude_hae_m
+            team.uav_pilot_callsign = decl.uav_pilot_callsign
             team.run_id = None
             team.run_start_declaration_seq = None
             team.ended = False
@@ -298,6 +315,32 @@ class FleetState:
             elif v.last_hb.state != common_pb2.STATE_AUTO:
                 blockers.append(f"{vid} {robot_state_name(v.last_hb.state)} (needs AUTO)")
         return blockers
+
+    def declares_uav(self, team_id: str) -> bool:
+        team = self.teams.get(team_id)
+        if team is None:
+            return False
+        for vid in team.declared_vehicles:
+            v = self.vehicles.get((team_id, vid))
+            type_name = vehicle_type_name(v.vehicle_type) if v is not None else ""
+            if is_uav(vid, type_name):
+                return True
+        return False
+
+    def declaration_problems(self, team_id: str) -> List[str]:
+        """Why RoboCommand would refuse the team's RunDeclaration; empty when it accepts it.
+
+        Only a declaration with a UAV is checked: its geofence must lie within
+        the course boundary or UAV transit area, and its ceiling in (0, 50] m HAE.
+        """
+        team = self.teams.get(team_id)
+        if team is None or team.declaration_seq is None or not self.declares_uav(team_id):
+            return []
+        problems = geofence_problems(team.geofence, team.geofence_ceiling_hae_m,
+                                     self.course_corners, self.course_transit)
+        if len(self.course_corners) < 3:
+            problems.append("no course published: the UAV geofence can't be checked")
+        return problems
 
     def clear_drawings(self, team_id: Optional[str] = None) -> None:
         """Forget trails and Task 1 / Task 2 overlays (one team, or every team).

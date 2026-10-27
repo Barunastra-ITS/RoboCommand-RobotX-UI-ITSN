@@ -18,6 +18,7 @@ from robocommand_ui.proto_helper import (
 
 LatLng = Tuple[float, float]
 COURSE_TOPIC = f"{TOPIC_ROOT}/course"
+DEFAULT_MOVING_KEEP_OUT_M = 5.0     # MovingObjectAlert.keep_out_radius_m default (schema 2026-10-23)
 
 VEHICLE_TYPES = {
     "USV": rx_common_pb2.TYPE_USV,
@@ -45,10 +46,13 @@ def close_ring(corners: Sequence[LatLng]) -> List[LatLng]:
     return ring
 
 
-def build_course(course_id: str, pinger_freq_hz: int, corners: Sequence[LatLng]):
+def build_course(course_id: str, pinger_freq_hz: int, corners: Sequence[LatLng],
+                 transit: Sequence[LatLng] = ()):
+    """RxCourse; ``transit`` is the UAV transit area (empty: none)."""
     return rx_course_pb2.RxCourse(
         course_id=course_id, pinger_freq_hz=pinger_freq_hz,
-        corners=[_latlng(c) for c in corners], sent_at=now_ts())
+        corners=[_latlng(c) for c in corners], sent_at=now_ts(),
+        uav_transit_area=[_latlng(c) for c in transit])
 
 
 def point_in_polygon(point: LatLng, ring: Sequence[LatLng]) -> bool:
@@ -91,10 +95,12 @@ def all_clear(vehicle_type: str):
 
 
 def moving_object_alert(position: LatLng, heading_deg: float, speed_mps: float,
-                        affected_types: Iterable[str]):
+                        affected_types: Iterable[str],
+                        keep_out_radius_m: float = DEFAULT_MOVING_KEEP_OUT_M):
     return "moving_object_alert", rx_commands_pb2.MovingObjectAlert(
         position=_latlng(position), heading_deg=heading_deg, speed_mps=speed_mps,
-        affected_vehicle_types=[VEHICLE_TYPES[t] for t in affected_types])
+        affected_vehicle_types=[VEHICLE_TYPES[t] for t in affected_types],
+        keep_out_radius_m=keep_out_radius_m)
 
 
 class SendResult(NamedTuple):

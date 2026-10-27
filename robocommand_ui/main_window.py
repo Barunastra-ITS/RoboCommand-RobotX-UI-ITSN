@@ -342,12 +342,13 @@ class MainWindow(QMainWindow):
 
     def _start_run(self, team_id: str, declaration_seq: int, run_id: int):
         team = self.fleet.teams.get(team_id)
-        blockers = self.fleet.start_blockers(team_id)
+        blockers = self.fleet.start_blockers(team_id) + self.fleet.declaration_problems(team_id)
         if blockers:
             msg = f"{team_id} not ready to start: {'; '.join(blockers)}"
             self.statusBar().showMessage(msg)
             QMessageBox.warning(self, "Not ready", msg + "\n\nEvery declared vehicle must be "
-                                "LIVE and in AUTO.")
+                                "LIVE and in AUTO, and a UAV geofence must lie within the course "
+                                "or UAV transit area with a ceiling above 0 and at most 50 m HAE.")
             return
         if team is not None and team.run_state == "ACTIVE" and not self._confirm(
                 "Restart run?", f"{team_id} is already ACTIVE (run {team.run_id}). "
@@ -387,7 +388,8 @@ class MainWindow(QMainWindow):
         self.course_map.set_course(course)
         self.course_tab.show_broker_course(course)
         ring = [(c.latitude, c.longitude) for c in course.corners]
-        self.task4_tab.set_course(ring, course_center(ring))
+        self.fleet.set_course(ring, [(c.latitude, c.longitude) for c in course.uav_transit_area])
+        self.task4_tab.set_course(ring, course_center(ring), course)
         self._course = (ring, course.course_id)
         self.recorder.set_course(ring, course.course_id)
         name = course.course_id or "<no id>"
@@ -400,11 +402,13 @@ class MainWindow(QMainWindow):
         else:
             set_chip(self.course_id_label, f"COURSE {name}", theme.TEXT_MUTED)
             self.course_id_label.setToolTip(f"{course.pinger_freq_hz} Hz pinger, "
-                                            f"{len(course.corners)} corners")
+                                            f"{len(course.corners)} corners, UAV transit "
+                                            f"{len(course.uav_transit_area) or 'none'}")
             self._log(f"[RxCourse] {name} valid")
 
     def _on_course_cleared(self):
         self.course_tab.show_broker_course(None)
+        self.fleet.set_course([])
         set_chip(self.course_id_label, "COURSE —", theme.IDLE)
         self._log("[RxCourse] retained course cleared")
 
@@ -444,7 +448,16 @@ class MainWindow(QMainWindow):
         self._log(
             f"[RxRequest] {team_id} seq={request.seq} {request.WhichOneof('body')}")
         self._log_notices(self.fleet.ingest_request(team_id, request))
+        if request.WhichOneof("body") == "run_declaration" and self.fleet.declares_uav(team_id):
+            self._log_uav_declaration(team_id)
         self._sync_team_filter()
+
+    def _log_uav_declaration(self, team_id: str):
+        team = self.fleet.teams[team_id]
+        self._log(f"{team_id} UAV: pilot {team.uav_pilot_callsign or '<none>'}, geofence "
+                  f"{len(team.geofence)} points, ceiling {team.geofence_ceiling_hae_m:g} m HAE")
+        for problem in self.fleet.declaration_problems(team_id):
+            self._log(f"[WARN] {team_id} declaration refused by RoboCommand rules: {problem}")
 
     def _on_command(self, team_id: str, command):
         echo = self.fleet.is_applied_run_start(team_id, command)
