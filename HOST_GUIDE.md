@@ -100,6 +100,26 @@ listening. It calls `python3`, so prefer `python3.10 run_ui.py` on this laptop.
   runs, so the one-session rule of 4.2 is automatic.
 - Every send is logged on the Map tab as `[SENT] ITSN seq=n …`.
 
+### 2.4 Course devices: Task 1 beacons and Task 3 docking bays
+
+These are the ESPs from `robotx-light-esp-2026`, plain HTTP (port 80, no auth) on their own
+WiFi at `192.168.0.x`. Keep the course LAN on the cable and **join the devices' WiFi on this
+laptop's WiFi** (`nmcli dev wifi connect <ssid> password <pass>`); the subnets don't overlap,
+so MQTT stays on the cable. Check with `curl http://192.168.0.251/api/data`.
+
+| Tab | Device (default address) | Steps |
+|---|---|---|
+| **Task 1** | Light beacons, `Beacon Light RBX` (Beacon 1 `192.168.0.252`, Beacon 2 `.253`) | The chip turns **ONLINE** and *Beacon shows* the beacon's own state (refreshed every 2 s) → press a mode: **Flashing blue · entry**, **Solid blue · exit**, **Flashing red · starboard**, **Flashing green · port**, **Off · black obstacle** |
+| **Task 3** | Docking bays, `RBX_1` (`192.168.0.251`) | Each bay shows litres collected / target, flow and state (every 1 s). One column per tier, each with only its own colours: **Start Core** (no colour), **Start Advanced** (its *Colour*), **Start Disruptive** (its *Colour 1* / *Colour 2*). Starting turns the LED red and resets the litres; at the target it is green 5 s, then Advanced flashes its colour and Disruptive its colour 1 / off / colour 2 / off for 60 s. **Force success** for testing, **Manual colour…** while stopped, **Stop**. *Both bays*: **Target** (default 0.25 L; the bay readouts follow it as you type, sent automatically on each connect, **Set** resends it; lost on ESP reboot), **Flow calibration** (default 4.90; kept by the ESP), **Stop both bays** |
+
+- Edit an address and press Enter to re-check it; addresses are remembered.
+- Buttons are disabled while a device is **OFFLINE**; the reason (timeout, refused) is shown
+  next to the chip. Devices are only polled while their tab is open.
+- Every device command, refusal and online/offline change is logged on the Map tab and in the
+  run log.
+- The beacon firmware joins `info wifi`, the dock `Soeromiber`: put them on one WiFi (change
+  `ssid` in the beacon's `main.cpp`), since the laptop joins only one.
+
 Sections 3–4 below describe the same messages with `test_client.py`, which you still need
 only for faking the GCS side (3.6).
 

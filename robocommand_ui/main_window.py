@@ -7,6 +7,8 @@ sends, so no ``test_client.py`` terminal is needed:
 - **Map**: boat movement on the course map, telemetry, teams, message log
 - **Course**: edit and publish the retained RxCourse, with saved presets
 - **Run start**: teams that declared a run; pick one and allow the start
+- **Task 1**: the light beacons (HTTP over the devices' WiFi)
+- **Task 3**: the docking bays: water collected, start / stop per tier
 - **Task 4**: Core / Advanced / Disruptive incident commands and their acks
 
 Nothing is published unless the operator presses a send button.
@@ -35,6 +37,8 @@ from robocommand_ui.widgets.course_tab import CourseTab
 from robocommand_ui.widgets.log_panel import LogPanel
 from robocommand_ui.widgets.panel import make_chip, set_chip
 from robocommand_ui.widgets.run_start_tab import RunStartTab
+from robocommand_ui.widgets.task1_tab import Task1Tab
+from robocommand_ui.widgets.task3_tab import Task3Tab
 from robocommand_ui.widgets.task4_tab import Task4Tab
 from robocommand_ui.widgets.teams_panel import RUN_COLORS, TeamsPanel, format_age
 from robocommand_ui.widgets.vehicle_monitor import VehicleMonitorPanel
@@ -220,6 +224,10 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(self.course_tab, "COURSE")
         self.run_start_tab = RunStartTab(self.recorder.directory)
         self.tabs.addTab(self.run_start_tab, "RUN START")
+        self.task1_tab = Task1Tab(self._settings)
+        self.tabs.addTab(self.task1_tab, "TASK 1")
+        self.task3_tab = Task3Tab(self._settings)
+        self.tabs.addTab(self.task3_tab, "TASK 3")
         self.task4_tab = Task4Tab()
         self.tabs.addTab(self.task4_tab, "TASK 4")
 
@@ -260,6 +268,8 @@ class MainWindow(QMainWindow):
         self.run_start_tab.end_requested.connect(self._end_run)
         self.run_start_tab.reset_requested.connect(self._reset_counters)
         self.task4_tab.command_requested.connect(self._send_task4)
+        self.task1_tab.log.connect(self._log)
+        self.task3_tab.log.connect(self._log)
 
     # ---------- connection ----------
     def _on_connect(self, host: str, port: int):
@@ -613,4 +623,6 @@ class MainWindow(QMainWindow):
             self._close_run_log(team_id, "console closed during the run")
         self.mqtt.stop()
         self.mqtt.wait(2000)
+        for tab in (self.task1_tab, self.task3_tab):
+            tab.runner.wait()           # device calls time out within TIMEOUT_S
         event.accept()

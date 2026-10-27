@@ -4,7 +4,7 @@ Two programs for the RobotX 2026 communications protocol (Team Handbook §3.4):
 
 | Program | Runs on | Does |
 |---|---|---|
-| `run_ui.py` — **RoboCommand** (Qt) | The course RoboCommand host, e.g. `192.168.65.2` | Shows everything teams report (boat movement, telemetry) and sends what RoboCommand sends: course, RunStart, Task 4 |
+| `run_ui.py` — **RoboCommand** (Qt) | The course RoboCommand host, e.g. `192.168.65.2` | Shows everything teams report (boat movement, telemetry) and sends what RoboCommand sends: course, RunStart, Task 4; drives the Task 1 beacons and Task 3 docking bays over WiFi (HOST_GUIDE §2.4) |
 | `report.py` — **GCS Reporter** | The team GCS/OCS | Finds the course host, connects to it, declares the run, sends 2 Hz heartbeats |
 
 ```
